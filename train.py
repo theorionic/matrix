@@ -372,8 +372,10 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False) -> None:
     print(f"[DWA] Training for {tcfg.total_steps} steps "
           f"({n_windows} windows × {tcfg.steps_per_window} steps)")
 
-    # Steady-state tracking (excludes compilation windows > 0.5s)
+    # Steady-state tracking — adaptive threshold: start at 3s, then 4× min observed.
+    # Handles both tiny models (steady ~0.03s) and large ones (steady ~1s).
     _ss_steps, _ss_time = 0, 0.0
+    _win_min = float("inf")
 
     t0 = time.time()
     for window_idx in range(n_windows):
@@ -418,10 +420,12 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False) -> None:
         win_tok_per_sec = int(win_steps_per_sec * tcfg.batch_size * cfg.seq_len)
 
         achieved_tflops = step_flops * win_steps_per_sec / 1e12
-        is_compile_win = win_secs > 0.5
+        compile_thresh = (max(3.0, 4.0 * _win_min) if _win_min < float("inf") else 3.0)
+        is_compile_win = win_secs > compile_thresh
         if not is_compile_win:
             _ss_steps += tcfg.steps_per_window
             _ss_time  += win_secs
+            _win_min   = min(_win_min, win_secs)
         print(
             f"[DWA] step={steps_done:6d}/{tcfg.total_steps} "
             f"phase={phase:8s} λ={scheduler.get_lambda(start_step):.2f} "
