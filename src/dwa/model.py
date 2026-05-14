@@ -5,6 +5,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from .assembly import WeightAssembler
+from .assembly_pallas import assemble_jax, pallas_assemble
 from .config import DWAConfig, TrainConfig
 from .losses import aux_losses, task_loss
 from .parts import PartA, PartB
@@ -35,46 +36,67 @@ class DWAModel(nnx.Module):
 
     def __call__(
         self,
-        input_ids: jnp.ndarray,  # [B, seq_len]
-        lambda_val: float,        # current retrieval sharpness
-        is_warmup: bool,          # static — controls warmup vs gate selection
+        input_ids: jnp.ndarray,          # [B, seq_len]
+        lambda_val: float,                # current retrieval sharpness
+        is_warmup: bool,                  # static — controls warmup vs gate
+        key_cache: jnp.ndarray | None = None,  # [S, N, d_k] pre-computed keys
+        use_pallas: bool = True,          # use Pallas assembly kernel
     ) -> tuple[jnp.ndarray, dict]:
         """
         Returns:
             logits:  [B, seq_len, vocab_size]
             metrics: dict with alphas, indices, W, aux-loss components
+
+        key_cache: if provided (recommended), skip the [N,D]×[D,d_k] key
+            projection matmul — use the pre-computed cache instead.
+            Compute it once per window with compute_key_cache() and pass in.
         """
         cfg = self.cfg
 
-        # Sinusoidal position encoding (added to embeddings)
+        # Sinusoidal position encoding
         x = self.embed(input_ids)           # [B, T, d_A]
         T = x.shape[1]
         pos = _sinusoidal_pos_enc(T, cfg.d_A)
-        x = x + pos[None]                   # broadcast over batch
+        x = x + pos[None]
 
         # Part A
         h_A = self.part_a(x)                # [B, T, d_A]
+        z = h_A.mean(axis=1)               # [B, d_A] — retrieval query
 
-        # Hidden state for retrieval: pool over sequence (mean of last tokens)
-        z = h_A.mean(axis=1)               # [B, d_A]
-
-        # Pool keys (recomputed each forward pass; XLA fuses the matmul)
-        pool_keys = self.pool.compute_keys()   # [S, N, d_k]
+        # Key cache: use provided cache or compute on-the-fly
+        if key_cache is None:
+            pool_keys = self.pool.compute_keys()   # [S, N, d_k] — expensive
+        else:
+            pool_keys = key_cache                  # [S, N, d_k] — free
 
         # Retrieval
         alphas, indices = self.retrieval(z, pool_keys, lambda_val, is_warmup)
-        # alphas: [B, k_max], indices: [B, k_max]
 
-        # Gather pool vectors for retrieved indices: [B, k_max, D]
+        # Gather pool vectors: [B, k_max, D]; cast to float32 if pool is bfloat16
         gathered = self.pool.vectors[...][indices]
+        if gathered.dtype != jnp.float32:
+            gathered = gathered.astype(jnp.float32)
 
-        # Assemble W and apply residual
-        h_mid, W = self.assembler(h_A, gathered, alphas)   # [B, T, d_B]
+        # Assembly — Pallas kernel keeps W in VMEM; falls back to pure JAX
+        W_base = self.assembler.W_base[...]
+        b_base = self.assembler.b_base[...]
+        gamma  = self.assembler.gamma[...]
+
+        if use_pallas:
+            h_mid_no_ln, W = pallas_assemble(
+                gathered, alphas, h_A, W_base, b_base, gamma,
+                cfg.d_B, cfg.r, cfg.d_A,
+            )
+            h_mid = self.assembler.layer_norm(h_mid_no_ln)
+        else:
+            h_mid_no_ln, W = assemble_jax(
+                gathered, alphas, h_A, W_base, b_base, gamma,
+                cfg.d_B, cfg.r, cfg.d_A,
+            )
+            h_mid = self.assembler.layer_norm(h_mid_no_ln)
 
         # Part B
         h_out = self.part_b(h_mid)          # [B, T, d_B]
-
-        # LM head
         logits = self.lm_head(h_out)        # [B, T, vocab_size]
 
         metrics = {
@@ -82,7 +104,7 @@ class DWAModel(nnx.Module):
             "indices": indices,
             "W": W,
             "pool_keys": pool_keys,
-            "W_base": self.assembler.W_base[...],
+            "W_base": W_base,
         }
         return logits, metrics
 
@@ -104,9 +126,11 @@ def forward_and_loss(
     is_warmup: bool,
     tcfg: TrainConfig,
     aux_on: bool,
+    key_cache: jnp.ndarray | None = None,
+    use_pallas: bool = True,
 ) -> tuple[jnp.ndarray, dict]:
     """Combined forward + loss for use with nnx.value_and_grad."""
-    logits, metrics = model(input_ids, lambda_val, is_warmup)
+    logits, metrics = model(input_ids, lambda_val, is_warmup, key_cache, use_pallas)
     l_task = task_loss(logits, input_ids)
 
     if aux_on:

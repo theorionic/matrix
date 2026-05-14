@@ -35,6 +35,9 @@ class DWAConfig:
     # Assembly init
     gamma_init: float = 0.01   # LoRA-style residual scalar init
 
+    # Memory / precision
+    bf16_pool: bool = False  # store pool vectors in bfloat16 (halves gather bandwidth)
+
     def __post_init__(self):
         needed = self.d_B * self.r + self.r * self.d_A + self.d_B
         assert self.D >= needed, (
@@ -52,6 +55,39 @@ class DWAConfig:
             k_max=8, S=2, d_k=32,
             n_heads=2, n_layers_A=1, n_layers_B=1,
             ffn_mult=4, vocab_size=1000, seq_len=64,
+        )
+
+    @classmethod
+    def medium(cls) -> "DWAConfig":
+        """
+        Fits on 8×TPU v5e-16GB.
+
+        Pool+Adam memory per device: 16384×4096×12B ≈ 3.2GB
+        Leaves ~12GB for activations, other params, and VMEM buffers.
+        D=4096 ≥ d_B*r + r*d_A + d_B = 128*12 + 12*128 + 128 = 3200 ✓
+        """
+        return cls(
+            D=4096, N=16384, d_A=128, d_B=128, r=12,
+            k_max=16, S=4, d_k=64,
+            n_heads=4, n_layers_A=4, n_layers_B=4,
+            ffn_mult=4, vocab_size=32000, seq_len=256,
+        )
+
+    @classmethod
+    def medium_mxu(cls, bf16: bool = False) -> "DWAConfig":
+        """
+        MXU-aligned variant of medium: r=128 so assembly matmuls are 128×128×128
+        (perfect fit for the TPU v5e systolic array vs r=12 which fills ~9% of a tile).
+
+        D=33024 (=258×128) ≥ d_B*r + r*d_A + d_B = 128*128 + 128*128 + 128 = 32896 ✓
+        N reduced to 2048 to keep pool+Adam ≈ 800MB — same as medium.
+        """
+        return cls(
+            D=33024, N=2048, d_A=128, d_B=128, r=128,
+            k_max=16, S=4, d_k=64,
+            n_heads=4, n_layers_A=4, n_layers_B=4,
+            ffn_mult=4, vocab_size=32000, seq_len=256,
+            bf16_pool=bf16,
         )
 
     @property

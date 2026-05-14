@@ -19,23 +19,25 @@ class VectorPool(nnx.Module):
 
     def __init__(self, cfg: DWAConfig, rngs: nnx.Rngs) -> None:
         self.cfg = cfg
+        pool_dtype = jnp.bfloat16 if cfg.bf16_pool else jnp.float32
         # Pool vectors: [N, D] — initialized small so early training is stable
         self.vectors = nnx.Param(
-            jax.random.normal(rngs.params(), (cfg.N, cfg.D)) * 0.02
+            (jax.random.normal(rngs.params(), (cfg.N, cfg.D)) * 0.02).astype(pool_dtype)
         )
         # Key projections per aspect: [S, D, d_k]
         self.key_proj = nnx.Param(
-            jax.random.normal(rngs.params(), (cfg.S, cfg.D, cfg.d_k))
-            * (cfg.D ** -0.5)
+            (jax.random.normal(rngs.params(), (cfg.S, cfg.D, cfg.d_k))
+             * (cfg.D ** -0.5)).astype(pool_dtype)
         )
 
     def compute_keys(self) -> jnp.ndarray:
         """
         Project all pool vectors through each aspect key projection.
-        Returns: [S, N, d_k]
+        Returns: [S, N, d_k] in float32 regardless of storage dtype.
         """
-        # vectors: [N, D], key_proj: [S, D, d_k]
-        return jnp.einsum("nd,sda->sna", self.vectors[...], self.key_proj[...])
+        vecs = self.vectors[...].astype(jnp.float32)
+        kp   = self.key_proj[...].astype(jnp.float32)
+        return jnp.einsum("nd,sda->sna", vecs, kp)
 
     def get_factors(self, indices: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """

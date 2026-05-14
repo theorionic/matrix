@@ -42,6 +42,7 @@ import optax
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from src.dwa.assembly_pallas import compute_key_cache
 from src.dwa.config import DWAConfig, TrainConfig
 from src.dwa.model import DWAModel, forward_and_loss
 from src.dwa.schedule import PhaseScheduler
@@ -89,10 +90,17 @@ def _build_optimizer(model: DWAModel, tcfg: TrainConfig) -> nnx.Optimizer:
 # Training window (compiled with nnx.jit; runs steps_per_window steps on TPU)
 # ---------------------------------------------------------------------------
 
-def _make_train_window(tcfg: TrainConfig, is_warmup: bool, aux_on: bool):
+def _make_train_window(tcfg: TrainConfig, is_warmup: bool, aux_on: bool, use_pallas: bool = True):
     """
     Returns a compiled function that runs steps_per_window training steps
     inside a single jax.lax.scan call.
+
+    Optimizations:
+    - key_cache: the [S,N,d_k] key projection is computed once per window
+      (outside the scan), not per step.  Reduces per-step HBM reads from
+      the 2 GB pool to a 32 MB cache read.
+    - use_pallas: the assembly stage runs in a Pallas kernel that keeps the
+      assembled W matrix in VMEM without a round-trip to HBM.
 
     is_warmup and aux_on are static (they change only ~twice over training).
     """
@@ -107,31 +115,37 @@ def _make_train_window(tcfg: TrainConfig, is_warmup: bool, aux_on: bool):
         ema_decay: float,
     ) -> tuple[DWAModel, nnx.Optimizer, jnp.ndarray, dict]:
 
+        # --- KEY CACHE: compute once here, reuse for all steps in this window ---
+        # Pool vectors may be slightly stale within the window (they update each
+        # step), but the drift is small and the cost saving is large:
+        #   Without cache: steps_per_window × einsum([N,D],[D,d_k])
+        #   With cache:    1 × einsum([N,D],[D,d_k])
+        key_cache = compute_key_cache(
+            model.pool.vectors[...].astype(jnp.float32),
+            model.pool.key_proj[...].astype(jnp.float32),
+        )  # [S, N, d_k] — stays in HBM across the scan
+
         def step_fn(carry, xs):
             model, optimizer, pool_ema, step_in_window = carry
             batch, lam = xs  # batch: [B, seq_len], lam: scalar
 
             def loss_fn(m):
-                return forward_and_loss(m, batch, lam, is_warmup, tcfg, aux_on)
+                return forward_and_loss(
+                    m, batch, lam, is_warmup, tcfg, aux_on,
+                    key_cache=key_cache, use_pallas=use_pallas,
+                )
 
             (loss, info), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
             optimizer.update(model, grads)
 
-            # Update pool utilisation EMA using the current batch's alphas
+            # Update pool utilisation EMA
             alphas = info["alphas"]      # [B, k_max]
             indices = info["indices"]    # [B, k_max]
-            # Scatter mean alpha per vector (coarse but sufficient for L_util)
             usage = jnp.zeros(model.cfg.N).at[indices.reshape(-1)].add(
                 alphas.reshape(-1) / (batch.shape[0] + 1e-8)
             )
             pool_ema = ema_update(pool_ema, usage, ema_decay)
 
-            jax.debug.print(
-                "  step_in_window={s} loss={l:.4f} l_task={lt:.4f} l_aux={la:.4f}",
-                s=step_in_window, l=loss,
-                lt=info["l_task"], la=info["total_aux"],
-                ordered=False,
-            )
             return (model, optimizer, pool_ema, step_in_window + 1), loss
 
         init_carry = (model, optimizer, pool_ema_in, jnp.array(0))
@@ -165,6 +179,45 @@ def _synthetic_window(
 
 
 # ---------------------------------------------------------------------------
+# Pallas probe — check at startup whether the kernel compiles successfully
+# ---------------------------------------------------------------------------
+
+def _probe_pallas(cfg: DWAConfig, mesh: Mesh) -> bool:
+    """
+    Try to JIT-compile the Pallas kernel with sharded inputs matching the
+    actual training setup.  Mosaic kernels cannot be auto-partitioned by GSPMD,
+    so probing on unsharded data gives a false positive.  We probe with sharded
+    data inside the mesh so the partitioner failure is detected here.
+    Returns True if successful, False (→ pure-JAX fallback) otherwise.
+    """
+    from src.dwa.assembly_pallas import _pallas_assemble_forward
+    try:
+        n_dev = len(mesh.devices)
+        B_probe = n_dev  # one item per device
+        gathered = jax.device_put(
+            jnp.zeros((B_probe, cfg.k_max, cfg.D)),
+            NamedSharding(mesh, P("batch", None, None)),
+        )
+        alphas = jax.device_put(
+            jnp.ones((B_probe, cfg.k_max)) / cfg.k_max,
+            NamedSharding(mesh, P("batch", None)),
+        )
+        h_A = jax.device_put(
+            jnp.zeros((B_probe, cfg.seq_len, cfg.d_A)),
+            NamedSharding(mesh, P("batch", None, None)),
+        )
+        W_base = jnp.zeros((cfg.d_B, cfg.d_A))
+        b_base = jnp.zeros(cfg.d_B)
+        gamma  = jnp.array(cfg.gamma_init)
+        jax.jit(
+            _pallas_assemble_forward, static_argnums=(6, 7, 8)
+        )(gathered, alphas, h_A, W_base, b_base, gamma, cfg.d_B, cfg.r, cfg.d_A)
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
 
@@ -195,6 +248,10 @@ def train(cfg: DWAConfig, tcfg: TrainConfig) -> None:
     n_params = sum(x.size for x in jax.tree.leaves(nnx.state(model, nnx.Param)))
     print(f"[DWA] Total trainable params: {n_params / 1e6:.1f}M")
 
+    # Probe whether Pallas assembly works with multi-device sharding
+    _use_pallas = _probe_pallas(cfg, mesh)
+    print(f"[DWA] Pallas assembly: {'enabled' if _use_pallas else 'disabled (falling back to pure JAX)'}")
+
     # Pre-JIT train windows for each phase
     # (re-compilation happens at phase boundaries, not per step)
     compiled_fns: dict[tuple, object] = {}
@@ -202,7 +259,7 @@ def train(cfg: DWAConfig, tcfg: TrainConfig) -> None:
     def get_train_fn(is_warmup: bool, aux_on: bool):
         key = (is_warmup, aux_on)
         if key not in compiled_fns:
-            compiled_fns[key] = _make_train_window(tcfg, is_warmup, aux_on)
+            compiled_fns[key] = _make_train_window(tcfg, is_warmup, aux_on, use_pallas=_use_pallas)
         return compiled_fns[key]
 
     n_windows = tcfg.total_steps // tcfg.steps_per_window
@@ -237,20 +294,25 @@ def train(cfg: DWAConfig, tcfg: TrainConfig) -> None:
         data_sharded = jax.device_put(data_window, NamedSharding(mesh, P(None, "batch", None)))
 
         train_fn = get_train_fn(is_warmup, aux_on)
+        t_win = time.time()
         model, optimizer, pool_ema, info = train_fn(
             model, optimizer, data_sharded, lam_window, pool_ema, tcfg.ema_decay
         )
+        # Block until TPU computation finishes before timing
+        jax.block_until_ready(info["losses"])
+        win_secs = time.time() - t_win
 
         steps_done += tcfg.steps_per_window
         elapsed = time.time() - t0
-        steps_per_sec = steps_done / elapsed
         mean_loss = float(info["losses"].mean())
+        win_steps_per_sec = tcfg.steps_per_window / win_secs
+        win_tok_per_sec = int(win_steps_per_sec * tcfg.batch_size * cfg.seq_len)
 
         print(
             f"[DWA] step={steps_done:6d}/{tcfg.total_steps} "
             f"phase={phase:8s} λ={scheduler.get_lambda(start_step):.2f} "
             f"loss={mean_loss:.4f} "
-            f"steps/s={steps_per_sec:.1f}"
+            f"win={win_secs:.1f}s  steps/s={win_steps_per_sec:.1f}  tok/s={win_tok_per_sec:,}"
         )
 
         # Update model's pool EMA (non-trainable variable)
@@ -265,17 +327,37 @@ def train(cfg: DWAConfig, tcfg: TrainConfig) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train DWA model")
-    parser.add_argument("--full", action="store_true", help="Use full-scale config")
+    parser.add_argument("--full",   action="store_true", help="Full-scale config (~13GB/device)")
+    parser.add_argument("--medium", action="store_true", help="Medium config (fits 16GB/device)")
+    parser.add_argument("--mxu",    action="store_true", help="MXU-aligned config: r=128, 128×128 assembly matmuls")
+    parser.add_argument("--bf16",   action="store_true", help="Store pool in bfloat16 (halves gather bandwidth)")
     parser.add_argument("--steps", type=int, default=None, help="Override total_steps")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--steps-per-window", type=int, default=None)
     args = parser.parse_args()
 
-    cfg = DWAConfig() if args.full else DWAConfig.small()
+    if args.full:
+        cfg = DWAConfig()
+    elif args.mxu:
+        cfg = DWAConfig.medium_mxu(bf16=args.bf16)
+    elif args.medium:
+        from src.dwa.config import DWAConfig as _DWA
+        cfg = _DWA.medium()
+        if args.bf16:
+            cfg.bf16_pool = True
+    else:
+        cfg = DWAConfig.small()
+
     tcfg = TrainConfig()
 
-    if not args.full:
-        # Small config: shrink training too
+    if args.full:
+        pass
+    elif args.mxu or args.medium:
+        tcfg.total_steps = tcfg.total_steps // 5
+        tcfg.warmup_steps = tcfg.warmup_steps // 5
+        tcfg.gate_on_steps = tcfg.gate_on_steps // 5
+        tcfg.batch_size = 128
+    else:
         tcfg.total_steps = tcfg.total_steps // 10
         tcfg.warmup_steps = tcfg.warmup_steps // 10
         tcfg.gate_on_steps = tcfg.gate_on_steps // 10
