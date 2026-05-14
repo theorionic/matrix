@@ -1,5 +1,6 @@
 def main():
-    print("Hello from matrix!")
+    from train import main as train_main
+    train_main()
 
 
 if __name__ == "__main__":
