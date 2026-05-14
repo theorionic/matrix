@@ -90,6 +90,33 @@ class DWAConfig:
             bf16_pool=bf16,
         )
 
+    @classmethod
+    def large(cls) -> "DWAConfig":
+        """
+        2× medium: double pool size and transformer depth.
+        Pool+Adam per device: 32768×4096×12B ≈ 1.6GB — fits 16GB TPU with room.
+        """
+        return cls(
+            D=4096, N=32768, d_A=128, d_B=128, r=12,
+            k_max=16, S=4, d_k=64,
+            n_heads=4, n_layers_A=8, n_layers_B=8,
+            ffn_mult=4, vocab_size=32000, seq_len=256,
+        )
+
+    @classmethod
+    def pattern_test(cls) -> "DWAConfig":
+        """
+        Small model with 16-token vocab for fast pattern-learning verification.
+        With period=4, seq=64: theoretical min loss ≈ 4/64 * log(16) ≈ 0.17 nats.
+        Random baseline: log(16) ≈ 2.77 nats.  Converges in ~3000 steps.
+        """
+        return cls(
+            D=2048, N=512, d_A=64, d_B=64, r=4,
+            k_max=8, S=2, d_k=32,
+            n_heads=2, n_layers_A=4, n_layers_B=4,
+            ffn_mult=4, vocab_size=16, seq_len=64,
+        )
+
     @property
     def factor_split(self) -> tuple[int, int, int]:
         """(split1, split2, split3) indices for slicing pool vectors into (U, V, b)."""
