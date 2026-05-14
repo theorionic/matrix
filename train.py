@@ -90,7 +90,8 @@ def _build_optimizer(model: DWAModel, tcfg: TrainConfig) -> nnx.Optimizer:
 # Training window (compiled with nnx.jit; runs steps_per_window steps on TPU)
 # ---------------------------------------------------------------------------
 
-def _make_train_window(tcfg: TrainConfig, is_warmup: bool, aux_on: bool, use_pallas: bool = True):
+def _make_train_window(tcfg: TrainConfig, is_warmup: bool, aux_on: bool,
+                       use_pallas: bool = True, mesh=None):
     """
     Returns a compiled function that runs steps_per_window training steps
     inside a single jax.lax.scan call.
@@ -99,10 +100,10 @@ def _make_train_window(tcfg: TrainConfig, is_warmup: bool, aux_on: bool, use_pal
     - key_cache: the [S,N,d_k] key projection is computed once per window
       (outside the scan), not per step.  Reduces per-step HBM reads from
       the 2 GB pool to a 32 MB cache read.
-    - use_pallas: the assembly stage runs in a Pallas kernel that keeps the
-      assembled W matrix in VMEM without a round-trip to HBM.
+    - use_pallas: the assembly stage runs in a Pallas kernel via shard_map
+      (one kernel per device, each sees its local batch slice).
 
-    is_warmup and aux_on are static (they change only ~twice over training).
+    is_warmup, aux_on, use_pallas, and mesh are static closures.
     """
 
     @functools.partial(nnx.jit, static_argnames={})
@@ -116,10 +117,6 @@ def _make_train_window(tcfg: TrainConfig, is_warmup: bool, aux_on: bool, use_pal
     ) -> tuple[DWAModel, nnx.Optimizer, jnp.ndarray, dict]:
 
         # --- KEY CACHE: compute once here, reuse for all steps in this window ---
-        # Pool vectors may be slightly stale within the window (they update each
-        # step), but the drift is small and the cost saving is large:
-        #   Without cache: steps_per_window × einsum([N,D],[D,d_k])
-        #   With cache:    1 × einsum([N,D],[D,d_k])
         key_cache = compute_key_cache(
             model.pool.vectors[...].astype(jnp.float32),
             model.pool.key_proj[...].astype(jnp.float32),
@@ -132,7 +129,7 @@ def _make_train_window(tcfg: TrainConfig, is_warmup: bool, aux_on: bool, use_pal
             def loss_fn(m):
                 return forward_and_loss(
                     m, batch, lam, is_warmup, tcfg, aux_on,
-                    key_cache=key_cache, use_pallas=use_pallas,
+                    key_cache=key_cache, use_pallas=use_pallas, mesh=mesh,
                 )
 
             (loss, info), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
@@ -184,13 +181,10 @@ def _synthetic_window(
 
 def _probe_pallas(cfg: DWAConfig, mesh: Mesh) -> bool:
     """
-    Try to JIT-compile the Pallas kernel with sharded inputs matching the
-    actual training setup.  Mosaic kernels cannot be auto-partitioned by GSPMD,
-    so probing on unsharded data gives a false positive.  We probe with sharded
-    data inside the mesh so the partitioner failure is detected here.
-    Returns True if successful, False (→ pure-JAX fallback) otherwise.
+    Try to compile the Pallas assembly kernel via shard_map.
+    Each device sees one example; passes if kernel compiles cleanly.
     """
-    from src.dwa.assembly_pallas import _pallas_assemble_forward
+    from src.dwa.assembly_pallas import shard_pallas_assemble
     try:
         n_dev = len(mesh.devices)
         B_probe = n_dev  # one item per device
@@ -209,11 +203,15 @@ def _probe_pallas(cfg: DWAConfig, mesh: Mesh) -> bool:
         W_base = jnp.zeros((cfg.d_B, cfg.d_A))
         b_base = jnp.zeros(cfg.d_B)
         gamma  = jnp.array(cfg.gamma_init)
-        jax.jit(
-            _pallas_assemble_forward, static_argnums=(6, 7, 8)
-        )(gathered, alphas, h_A, W_base, b_base, gamma, cfg.d_B, cfg.r, cfg.d_A)
+        @jax.jit
+        def _probe_fn(g, a, h, wb, bb, gm):
+            return shard_pallas_assemble(g, a, h, wb, bb, gm,
+                                         cfg.d_B, cfg.r, cfg.d_A, mesh)
+        result = _probe_fn(gathered, alphas, h_A, W_base, b_base, gamma)
+        jax.block_until_ready(result)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[DWA] Pallas probe failed: {e}")
         return False
 
 
@@ -248,9 +246,12 @@ def train(cfg: DWAConfig, tcfg: TrainConfig) -> None:
     n_params = sum(x.size for x in jax.tree.leaves(nnx.state(model, nnx.Param)))
     print(f"[DWA] Total trainable params: {n_params / 1e6:.1f}M")
 
-    # Probe whether Pallas assembly works with multi-device sharding
-    _use_pallas = _probe_pallas(cfg, mesh)
-    print(f"[DWA] Pallas assembly: {'enabled' if _use_pallas else 'disabled (falling back to pure JAX)'}")
+    # Pallas + shard_map is verified correct but hits a TPU VMEM constraint
+    # when compiled inside jax.lax.scan + value_and_grad (the scan backward
+    # JVP context has a 16MB scoped VMEM limit that the kernel exceeds).
+    # Training uses pure-JAX; Pallas remains available for inference.
+    _use_pallas = False
+    print(f"[DWA] Pallas assembly: disabled for training (VMEM constraint in scan+vjp); available for inference")
 
     # Pre-JIT train windows for each phase
     # (re-compilation happens at phase boundaries, not per step)
@@ -259,7 +260,11 @@ def train(cfg: DWAConfig, tcfg: TrainConfig) -> None:
     def get_train_fn(is_warmup: bool, aux_on: bool):
         key = (is_warmup, aux_on)
         if key not in compiled_fns:
-            compiled_fns[key] = _make_train_window(tcfg, is_warmup, aux_on, use_pallas=_use_pallas)
+            compiled_fns[key] = _make_train_window(
+                tcfg, is_warmup, aux_on,
+                use_pallas=_use_pallas,
+                mesh=mesh if _use_pallas else None,
+            )
         return compiled_fns[key]
 
     n_windows = tcfg.total_steps // tcfg.steps_per_window

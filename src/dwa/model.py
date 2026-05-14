@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from .assembly import WeightAssembler
-from .assembly_pallas import assemble_jax, pallas_assemble
+from .assembly_pallas import assemble_jax, pallas_assemble, shard_pallas_assemble
 from .config import DWAConfig, TrainConfig
 from .losses import aux_losses, task_loss
 from .parts import PartA, PartB
@@ -41,6 +41,7 @@ class DWAModel(nnx.Module):
         is_warmup: bool,                  # static — controls warmup vs gate
         key_cache: jnp.ndarray | None = None,  # [S, N, d_k] pre-computed keys
         use_pallas: bool = True,          # use Pallas assembly kernel
+        mesh=None,                        # jax.sharding.Mesh for shard_map Pallas
     ) -> tuple[jnp.ndarray, dict]:
         """
         Returns:
@@ -82,7 +83,13 @@ class DWAModel(nnx.Module):
         b_base = self.assembler.b_base[...]
         gamma  = self.assembler.gamma[...]
 
-        if use_pallas:
+        if use_pallas and mesh is not None:
+            h_mid_no_ln, W = shard_pallas_assemble(
+                gathered, alphas, h_A, W_base, b_base, gamma,
+                cfg.d_B, cfg.r, cfg.d_A, mesh,
+            )
+            h_mid = self.assembler.layer_norm(h_mid_no_ln)
+        elif use_pallas:
             h_mid_no_ln, W = pallas_assemble(
                 gathered, alphas, h_A, W_base, b_base, gamma,
                 cfg.d_B, cfg.r, cfg.d_A,
@@ -128,9 +135,10 @@ def forward_and_loss(
     aux_on: bool,
     key_cache: jnp.ndarray | None = None,
     use_pallas: bool = True,
+    mesh=None,
 ) -> tuple[jnp.ndarray, dict]:
     """Combined forward + loss for use with nnx.value_and_grad."""
-    logits, metrics = model(input_ids, lambda_val, is_warmup, key_cache, use_pallas)
+    logits, metrics = model(input_ids, lambda_val, is_warmup, key_cache, use_pallas, mesh)
     l_task = task_loss(logits, input_ids)
 
     if aux_on:
