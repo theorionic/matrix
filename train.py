@@ -35,7 +35,11 @@ _jax_cfg.config.update = _safe_update
 
 import argparse
 import functools
+import glob
+import os
+import pickle
 import time
+from collections import deque
 from typing import NamedTuple
 
 import jax
@@ -80,6 +84,7 @@ def _build_optimizer(model: DWAModel, tcfg: TrainConfig) -> nnx.Optimizer:
         return jax.tree_util.tree_unflatten(treedef, flags)
 
     tx = optax.chain(
+        optax.clip_by_global_norm(tcfg.grad_clip_norm),   # must be first
         optax.masked(optax.adam(tcfg.lr_pool), _make_mask("pool")),
         optax.masked(optax.adam(tcfg.lr_threshold), _make_mask("threshold")),
         optax.masked(optax.adam(tcfg.lr_retrieval), _make_mask("retrieval")),
@@ -234,23 +239,54 @@ def _make_train_window(tcfg: TrainConfig, is_warmup: bool, aux_on: bool,
                 )
 
             (loss, info), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+
+            # --- NaN / Inf guard ---
+            # Compute the sum of squared gradient values in one pass.
+            # If any gradient leaf contains NaN/Inf the sum propagates it,
+            # so a single isnan(grad_sq_sum) check covers all parameters.
+            grad_state  = nnx.state(grads, nnx.Param)
+            grad_leaves = jax.tree_util.tree_leaves(grad_state)
+            grad_sq_sum = sum(
+                jnp.sum(g.astype(jnp.float32) ** 2) for g in grad_leaves
+            )
+            has_bad = (
+                jnp.isnan(loss) | jnp.isinf(loss)
+                | jnp.isnan(grad_sq_sum) | jnp.isinf(grad_sq_sum)
+            )
+            # Zero out gradients for the poisoned step so Adam moments stay clean.
+            safe_state = jax.tree_util.tree_map(
+                lambda g: jnp.where(has_bad, jnp.zeros_like(g), g), grad_state
+            )
+            nnx.update(grads, safe_state)
+            # Pre-clip grad norm (NaN replaced with 0 so downstream metrics are clean).
+            grad_norm = jnp.sqrt(jnp.where(has_bad, jnp.zeros_like(grad_sq_sum), grad_sq_sum))
+
             optimizer.update(model, grads)
+            safe_loss = jnp.where(has_bad, jnp.zeros_like(loss), loss)
 
             # Update pool utilisation EMA
-            alphas = info["alphas"]      # [B, k_max]
-            indices = info["indices"]    # [B, k_max]
+            alphas  = info["alphas"]   # [B, k_max]
+            indices = info["indices"]  # [B, k_max]
             usage = jnp.zeros(model.cfg.N).at[indices.reshape(-1)].add(
                 alphas.reshape(-1) / (batch.shape[0] + 1e-8)
             )
             pool_ema = ema_update(pool_ema, usage, ema_decay)
 
-            return (model, optimizer, pool_ema, step_in_window + 1), loss
+            return (
+                (model, optimizer, pool_ema, step_in_window + 1),
+                (safe_loss, indices, grad_norm, has_bad.astype(jnp.int32)),
+            )
 
         init_carry = (model, optimizer, pool_ema_in, jnp.array(0))
-        (model, optimizer, pool_ema_out, _), losses = jax.lax.scan(
-            step_fn, init_carry, (data, lambda_vals)
+        (model, optimizer, pool_ema_out, _), (losses, all_indices, grad_norms, nan_flags) = (
+            jax.lax.scan(step_fn, init_carry, (data, lambda_vals))
         )
-        return model, optimizer, pool_ema_out, {"losses": losses}
+        return model, optimizer, pool_ema_out, {
+            "losses":       losses,           # [steps_per_window]
+            "last_indices": all_indices[-1],  # [B, k_max] — last step only
+            "grad_norms":   grad_norms,       # [steps_per_window]
+            "nan_flags":    nan_flags,        # [steps_per_window] int32
+        }
 
     return train_window
 
@@ -274,6 +310,51 @@ def _synthetic_window(
         lambda k: jax.random.randint(k, (batch_size, seq_len), 0, vocab_size)
     )(keys)
     return batches
+
+
+# ---------------------------------------------------------------------------
+# TinyStories real data loader — streaming, chunked iterator
+# ---------------------------------------------------------------------------
+
+class TinyStoriesLoader:
+    """
+    Streams roneneldan/TinyStories, tokenises with GPT-2, and packs tokens
+    into fixed-length windows.  Uses the chunked-iterator pattern:
+
+        iterator = dataset.iter(batch_size=CHUNK_SIZE)
+        chunk = next(iterator)   # dict {"text": [str, ...]}
+
+    A token buffer accumulates across chunks so we never download more than
+    needed.  get_window() refills automatically when the buffer runs low.
+    """
+
+    CHUNK_SIZE = 2000  # stories per HuggingFace fetch
+
+    def __init__(self, tokenizer, seq_len: int):
+        from datasets import load_dataset
+        self.tokenizer = tokenizer
+        self.seq_len   = seq_len
+        dataset        = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+        self._iterator = dataset.iter(batch_size=self.CHUNK_SIZE)
+        self._buf: list[int] = []
+        print(f"[DWA] TinyStories loader ready (chunk={self.CHUNK_SIZE} stories, seq_len={seq_len})")
+
+    def _refill(self) -> None:
+        chunk = next(self._iterator)          # {"text": ["Once upon a time ...", ...]}
+        eos   = self.tokenizer.eos_token_id
+        for text in chunk["text"]:
+            self._buf.extend(self.tokenizer.encode(text))
+            if eos is not None:
+                self._buf.append(eos)
+
+    def get_window(self, steps: int, batch_size: int) -> np.ndarray:
+        """Return int32 array [steps, batch_size, seq_len] of real token IDs."""
+        needed = steps * batch_size * self.seq_len
+        while len(self._buf) < needed:
+            self._refill()
+        tokens    = np.array(self._buf[:needed], dtype=np.int32)
+        self._buf = self._buf[needed:]
+        return tokens.reshape(steps, batch_size, self.seq_len)
 
 
 # ---------------------------------------------------------------------------
@@ -310,15 +391,27 @@ def generate(
     prefix_ids,               # list[int] or 1-D array
     n_new: int,
     tcfg: TrainConfig,
+    temperature: float = 0.8,
+    repetition_penalty: float = 1.3,
 ) -> list[int]:
-    """Greedy next-token generation. Returns full token list (prefix + new)."""
+    """Temperature-sampled generation with repetition penalty on recent tokens."""
     tokens = list(map(int, prefix_ids))
     cfg = model.cfg
     lam = tcfg.lambda_sharpen_end
+    rng = jax.random.PRNGKey(0)
     for _ in range(n_new):
         ids = jnp.array(tokens[-cfg.seq_len:], dtype=jnp.int32)[None]   # [1, T]
         logits, _ = model(ids, lam, is_warmup=False, use_pallas=False)
-        tokens.append(int(jnp.argmax(logits[0, -1])))
+        logit_vec = np.array(logits[0, -1], dtype=np.float32)           # host copy
+
+        # Down-weight tokens seen in the recent context window
+        for t in set(tokens[-64:]):
+            if 0 <= t < len(logit_vec):
+                logit_vec[t] /= repetition_penalty
+
+        logit_vec /= temperature
+        rng, k = jax.random.split(rng)
+        tokens.append(int(jax.random.categorical(k, jnp.array(logit_vec))))
     return tokens
 
 
@@ -344,6 +437,82 @@ def _verify_learning(
         acc     = sum(g == e for g, e in zip(gen_new, exp_new)) / n_gen
         ok      = "✓" if acc >= 0.875 else "✗"
         print(f"  [{ok}] pattern={pattern}  gen={gen_new}  exp={exp_new}  acc={acc:.0%}")
+
+
+# ---------------------------------------------------------------------------
+# Text generation helper for TinyStories learning verification
+# ---------------------------------------------------------------------------
+
+def _generate_text_sample(model: DWAModel, tokenizer, tcfg: TrainConfig, step: int) -> None:
+    """Generate ~60 tokens from a fixed prompt and print decoded text."""
+    prompt = "Once upon a time"
+    ids    = tokenizer.encode(prompt)
+    out    = generate(model, ids, n_new=60, tcfg=tcfg)
+    text   = tokenizer.decode(out, skip_special_tokens=True)
+    print(f"\n[DWA] step={step} sample: {text}\n")
+
+
+# ---------------------------------------------------------------------------
+# Safety helpers (run on host, outside JIT)
+# ---------------------------------------------------------------------------
+
+def _check_nan_params(model: DWAModel) -> tuple[bool, str]:
+    """Scan all trainable parameters for NaN / Inf values.
+
+    Returns (has_bad, first_bad_path).  Called every few windows so we catch
+    corruption early instead of discovering it at the end of a run.
+    """
+    params = nnx.state(model, nnx.Param)
+    for path, leaf in jax.tree_util.tree_flatten_with_path(params)[0]:
+        arr = np.array(leaf)
+        if np.any(~np.isfinite(arr)):
+            name = "/".join(str(k) for k in path)
+            return True, name
+    return False, ""
+
+
+def _revive_dead_vectors(
+    model: DWAModel,
+    pool_ema: jnp.ndarray,
+    cfg: DWAConfig,
+    step: int,
+) -> int:
+    """Replace pool vectors that have near-zero EMA usage.
+
+    Dead vectors are re-seeded as perturbed copies of high-usage vectors so
+    they start with meaningful geometry rather than drifting randomly.
+    The existing sharding of model.pool.vectors is preserved.
+
+    Returns the number of vectors revived.
+    """
+    ema_np = np.array(pool_ema, dtype=np.float32)
+    dead_mask = ema_np < cfg.dead_vector_threshold
+    n_dead = int(dead_mask.sum())
+    if n_dead == 0:
+        return 0
+
+    # Donors: top-50% by EMA usage (avoids picking just-revived vectors)
+    median_ema = float(np.median(ema_np[ema_np > 0])) if (ema_np > 0).any() else 0.0
+    donor_idx = np.where(ema_np >= median_ema)[0]
+    if len(donor_idx) == 0:
+        return 0
+
+    dead_idx = np.where(dead_mask)[0]
+    pool_np  = np.array(model.pool.vectors[...], dtype=np.float32)  # gather to host
+    rng      = np.random.default_rng(step)
+
+    chosen_donors = rng.choice(donor_idx, size=n_dead, replace=True)
+    noise = rng.normal(0.0, 0.01, (n_dead, cfg.D)).astype(pool_np.dtype)
+    pool_np[dead_idx] = pool_np[chosen_donors] + noise
+
+    # Put back — honour the existing sharding (model-parallel or replicated)
+    orig_arr = model.pool.vectors[...]
+    new_jax  = jnp.array(pool_np, dtype=orig_arr.dtype)
+    orig_sharding = getattr(orig_arr, "sharding", None)
+    if orig_sharding is not None:
+        new_jax = jax.device_put(new_jax, orig_sharding)
+    model.pool.vectors[...] = new_jax
+    return n_dead
 
 
 # ---------------------------------------------------------------------------
@@ -387,10 +556,74 @@ def _probe_pallas(cfg: DWAConfig, mesh: Mesh) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Parameter breakdown table
+# ---------------------------------------------------------------------------
+
+def _print_param_table(model: DWAModel) -> None:
+    """Print a per-component parameter count and memory table at training start."""
+    GROUPS = [
+        ("Embedding",          lambda p: p.startswith("embed")),
+        ("Part A · Attention", lambda p: p.startswith("part_a") and "attn" in p),
+        ("Part A · FFN",       lambda p: p.startswith("part_a") and "ffn"  in p),
+        ("Part A · Norms",     lambda p: p.startswith("part_a") and "norm" in p),
+        ("Part B · Attention", lambda p: p.startswith("part_b") and "attn" in p),
+        ("Part B · FFN",       lambda p: p.startswith("part_b") and "ffn"  in p),
+        ("Part B · Norms",     lambda p: p.startswith("part_b") and "norm" in p),
+        ("Pool · Vectors",     lambda p: p.startswith("pool")   and "vectors" in p),
+        ("Pool · Key Proj",    lambda p: p.startswith("pool")   and "key_proj" in p),
+        ("Retrieval",          lambda p: p.startswith("retrieval")),
+        ("Assembler",          lambda p: p.startswith("assembler")),
+        ("LM Head",            lambda p: p.startswith("lm_head")),
+    ]
+
+    pure = nnx.as_pure(nnx.state(model, nnx.Param))
+    lpaths, _ = jax.tree_util.tree_flatten_with_path(pure)
+
+    def _pstr(path) -> str:
+        # DictKey(key='foo') → 'foo'; fallback to str() for other key types
+        return "/".join(str(k.key) if hasattr(k, "key") else str(k) for k in path)
+
+    counts: dict[str, int] = {label: 0 for label, _ in GROUPS}
+    mbytes: dict[str, int] = {label: 0 for label, _ in GROUPS}
+    other_n = 0
+
+    for path, leaf in lpaths:
+        p = _pstr(path)
+        matched = False
+        for label, fn in GROUPS:
+            if fn(p):
+                counts[label] += leaf.size
+                mbytes[label] += leaf.size * leaf.dtype.itemsize
+                matched = True
+                break
+        if not matched:
+            other_n += leaf.size
+
+    total_n = sum(counts.values()) + other_n
+    total_b = sum(mbytes.values())
+    W = 24
+
+    print(f"\n[DWA] Parameter breakdown — {total_n / 1e6:.1f}M params, "
+          f"{total_b / 1e6:.0f} MB storage (dtype-aware):")
+    print(f"  {'Component':<{W}}  {'Params':>10}  {'Storage':>10}  {'Share':>6}")
+    print(f"  {'─' * W}  {'─' * 10}  {'─' * 10}  {'─' * 6}")
+    for label, _ in GROUPS:
+        n, b = counts[label], mbytes[label]
+        if n == 0:
+            continue
+        print(f"  {label:<{W}}  {n / 1e6:>8.3f} M  {b / 1e6:>7.1f} MB  {100 * n / total_n:>5.1f}%")
+    if other_n > 0:
+        print(f"  {'(unmatched)':<{W}}  {other_n / 1e6:>8.3f} M")
+    print(f"  {'─' * W}  {'─' * 10}  {'─' * 10}  {'─' * 6}")
+    print(f"  {'TOTAL':<{W}}  {total_n / 1e6:>8.3f} M  {total_b / 1e6:>7.1f} MB  100.0%\n")
+
+
+# ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
 
-def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False) -> None:
+def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False,
+          tokenizer=None, gen_every: int = 100) -> None:
     devices = jax.devices()
     n_devices = len(devices)
     device_kind = devices[0].device_kind
@@ -425,13 +658,15 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False) -> None:
     optimizer = _build_optimizer(model, tcfg)
     pool_ema = jnp.zeros(cfg.N)
 
-    # Count parameters
-    n_params = sum(x.size for x in jax.tree.leaves(nnx.state(model, nnx.Param)))
-    print(f"[DWA] Total trainable params: {n_params / 1e6:.1f}M")
+    _print_param_table(model)
 
     step_flops = compute_step_flops(cfg, tcfg)
+    data_label = "tiny_stories" if tokenizer is not None else ("pattern" if use_pattern else "random")
     print(f"[DWA] FLOPs/step (fwd+bwd, approx): {step_flops / 1e9:.1f}G"
-          f"  (data={'pattern' if use_pattern else 'random'})")
+          f"  (data={data_label})")
+
+    # TinyStories streaming loader (created once; maintains iterator state across windows)
+    loader = TinyStoriesLoader(tokenizer, cfg.seq_len) if tokenizer is not None else None
 
     # Pallas + shard_map is verified correct but hits a TPU VMEM constraint
     # when compiled inside jax.lax.scan + value_and_grad (the scan backward
@@ -460,11 +695,18 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False) -> None:
 
     print(f"[DWA] Training for {tcfg.total_steps} steps "
           f"({n_windows} windows × {tcfg.steps_per_window} steps)")
+    print(f"[DWA] Safety: grad_clip={tcfg.grad_clip_norm}  "
+          f"nan_stop={tcfg.nan_emergency_stop}w  "
+          f"spike_sigma={tcfg.loss_spike_sigma}σ  "
+          f"revival_every={tcfg.revival_interval_steps}s")
 
-    # Steady-state tracking — adaptive threshold: start at 3s, then 4× min observed.
-    # Handles both tiny models (steady ~0.03s) and large ones (steady ~1s).
+    # Steady-state tracking
     _ss_steps, _ss_time = 0, 0.0
     _win_min = float("inf")
+
+    # Safety state
+    _consecutive_nan = 0
+    _loss_window: deque = deque(maxlen=50)   # rolling buffer for spike detection
 
     t0 = time.time()
     for window_idx in range(n_windows):
@@ -478,7 +720,9 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False) -> None:
 
         # Data window [steps, B, seq_len]
         rng, data_rng = jax.random.split(rng)
-        if use_pattern:
+        if loader is not None:
+            data_window = jnp.array(loader.get_window(tcfg.steps_per_window, tcfg.batch_size))
+        elif use_pattern:
             data_window = _make_pattern_window(
                 data_rng, tcfg.steps_per_window, tcfg.batch_size,
                 cfg.seq_len, cfg.vocab_size,
@@ -498,7 +742,9 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False) -> None:
             model, optimizer, data_sharded, lam_window, pool_ema, tcfg.ema_decay
         )
         # Block until TPU computation finishes before timing
-        jax.block_until_ready(info["losses"])
+        jax.block_until_ready(
+            (info["losses"], info["last_indices"], info["grad_norms"], info["nan_flags"])
+        )
         win_secs = time.time() - t_win
 
         steps_done += tcfg.steps_per_window
@@ -522,6 +768,72 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False) -> None:
             f"tok/s={win_tok_per_sec:,}  TFLOP/s={achieved_tflops:.1f}"
             + ("  [compile]" if is_compile_win else "")
         )
+
+        # ── Safety checks ────────────────────────────────────────────────────
+
+        # 1. NaN / Inf in losses / gradients
+        nan_count  = int(info["nan_flags"].sum())
+        mean_gnorm = float(info["grad_norms"].mean())
+        max_gnorm  = float(info["grad_norms"].max())
+        if nan_count > 0:
+            _consecutive_nan += 1
+            print(
+                f"[Safety] NaN/Inf: {nan_count}/{tcfg.steps_per_window} steps "
+                f"(grads zeroed) — consecutive bad windows: "
+                f"{_consecutive_nan}/{tcfg.nan_emergency_stop}"
+            )
+            if _consecutive_nan >= tcfg.nan_emergency_stop:
+                print("[Safety] EMERGENCY STOP: too many consecutive NaN windows.")
+                break
+        else:
+            _consecutive_nan = 0
+
+        # 2. Loss spike detector (rolling mean ± σ over last 50 windows)
+        if len(_loss_window) >= 10:
+            mu    = float(np.mean(_loss_window))
+            sigma = float(np.std(_loss_window)) + 1e-8
+            if mean_loss > mu + tcfg.loss_spike_sigma * sigma:
+                print(
+                    f"[Safety] Loss spike: {mean_loss:.4f} vs "
+                    f"rolling {mu:.4f} ± {sigma:.4f} "
+                    f"({(mean_loss - mu) / sigma:.1f}σ)"
+                )
+        _loss_window.append(mean_loss)
+
+        # 3. Periodic parameter NaN check (every 10 windows — host-side scan)
+        if window_idx % 10 == 0:
+            has_bad, bad_name = _check_nan_params(model)
+            if has_bad:
+                print(f"[Safety] CRITICAL: NaN/Inf in parameter '{bad_name}'. Stopping.")
+                break
+
+        # 4. Pool-collapse check: unique vectors retrieved + EMA entropy
+        last_idx     = np.array(info["last_indices"])   # [B, k_max] on host
+        n_unique     = int(np.unique(last_idx).shape[0])
+        max_possible = min(tcfg.batch_size * cfg.k_max, cfg.N)
+        ema_np   = np.array(pool_ema)
+        ema_norm = ema_np / (ema_np.sum() + 1e-8)
+        entropy  = float(-np.sum(ema_norm * np.log(ema_norm + 1e-8)))
+        n_active = int((ema_np > 0.01 * ema_np.mean()).sum())
+        collapse_flag = n_unique < cfg.k_max * 2
+        print(
+            f"[Pool] unique={n_unique}/{max_possible}  "
+            f"active={n_active}/{cfg.N}  "
+            f"entropy={entropy / np.log(cfg.N):.3f}  "
+            f"gnorm_mean={mean_gnorm:.3f} max={max_gnorm:.3f}"
+            + ("  [COLLAPSE RISK]" if collapse_flag else "")
+        )
+
+        # 5. Dead vector revival (every revival_interval_steps steps)
+        if steps_done % tcfg.revival_interval_steps == 0:
+            n_revived = _revive_dead_vectors(model, pool_ema, cfg, steps_done)
+            if n_revived > 0:
+                print(f"[Safety] Revived {n_revived}/{cfg.N} dead pool vectors.")
+
+        # Text generation check every gen_every steps
+        prev_steps = steps_done - tcfg.steps_per_window
+        if tokenizer is not None and (steps_done // gen_every) > (prev_steps // gen_every):
+            _generate_text_sample(model, tokenizer, tcfg, steps_done)
 
         # Update model's pool EMA (non-trainable variable)
         model.pool_ema[...] = pool_ema
@@ -567,6 +879,10 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=None, help="Override total_steps")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--steps-per-window", type=int, default=None)
+    parser.add_argument("--tiny-stories", action="store_true",
+                        help="Train on roneneldan/TinyStories with GPT-2 tokenizer")
+    parser.add_argument("--gen-every", type=int, default=100,
+                        help="Generate a text sample every N steps (TinyStories mode only)")
     args = parser.parse_args()
 
     if args.verify:
@@ -642,7 +958,16 @@ def main() -> None:
     if args.steps_per_window is not None:
         tcfg.steps_per_window = args.steps_per_window
 
-    train(cfg, tcfg, use_pattern=args.verify)
+    tokenizer = None
+    if args.tiny_stories:
+        from transformers import GPT2TokenizerFast
+        tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+        # Pad vocab to the nearest multiple of 64 ≥ GPT-2's 50257 so that
+        # vocab_parallel sharding divides evenly for any n_model in {1,2,4,8}.
+        cfg.vocab_size = ((tokenizer.vocab_size + 63) // 64) * 64  # 50304
+        print(f"[DWA] TinyStories mode: GPT-2 tokenizer, padded vocab_size={cfg.vocab_size}")
+
+    train(cfg, tcfg, use_pattern=args.verify, tokenizer=tokenizer, gen_every=args.gen_every)
 
 
 if __name__ == "__main__":

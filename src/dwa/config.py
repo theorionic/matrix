@@ -197,6 +197,13 @@ class TrainConfig:
     # EMA decay for pool utilization tracking
     ema_decay: float = 0.99
 
+    # Safety mechanisms
+    grad_clip_norm: float = 1.0          # global gradient norm clipping
+    nan_emergency_stop: int = 5          # halt after this many consecutive NaN windows
+    loss_spike_sigma: float = 5.0        # warn if loss jumps > N rolling σ
+    dead_vector_threshold: float = 1e-6  # EMA below this → vector considered dead
+    revival_interval_steps: int = 1000   # how often to revive dead pool vectors
+
     @property
     def lr_warmup(self) -> int:
         return self.lr_warmup_steps
