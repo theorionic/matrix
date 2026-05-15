@@ -39,6 +39,7 @@ class DWAConfig:
     # Memory / precision
     bf16_pool: bool = False  # store pool vectors in bfloat16 (halves gather bandwidth)
     compute_dtype: Any = None  # None=float32; set to jnp.bfloat16 for ~4× MXU throughput
+    remat: bool = False        # gradient checkpointing: recompute activations, cut ~4× activation memory
 
     def __post_init__(self):
         needed = self.d_B * self.r + self.r * self.d_A + self.d_B
@@ -90,6 +91,22 @@ class DWAConfig:
             n_heads=4, n_layers_A=4, n_layers_B=4,
             ffn_mult=4, vocab_size=32000, seq_len=256,
             bf16_pool=bf16,
+        )
+
+    @classmethod
+    def full_wide(cls) -> "DWAConfig":
+        """
+        d=512 for ~3-4× better MXU fill vs d=256, same pool memory as --full.
+
+        N=32768 × D=32768 = same 4 GB pool footprint as --full (N=65536 × D=16384).
+        Pool+Adam/device with 4-way model parallel: 4 GB×3 / 4 = 3 GB — same budget.
+        n_heads=8 (head_dim=64).  Needs D ≥ d_B*r + r*d_A + d_B = 25088 → D=32768 ✓
+        """
+        return cls(
+            D=32768, N=32768, d_A=512, d_B=512, r=24,
+            k_max=16, S=4, d_k=64,
+            n_heads=8, n_layers_A=6, n_layers_B=6,
+            ffn_mult=4, vocab_size=32000, seq_len=512,
         )
 
     @classmethod

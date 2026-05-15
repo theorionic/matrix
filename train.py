@@ -552,9 +552,12 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train DWA model")
     parser.add_argument("--full",   action="store_true", help="Full-scale config (~13GB/device)")
+    parser.add_argument("--wide",   action="store_true", help="Full pool + d=512 for 3-4× better MXU fill")
     parser.add_argument("--large",  action="store_true", help="Large config (2× medium pool, 8 layers)")
     parser.add_argument("--medium", action="store_true", help="Medium config (fits 16GB/device)")
     parser.add_argument("--mxu",    action="store_true", help="MXU-aligned config: r=128, 128×128 assembly matmuls")
+    parser.add_argument("--remat",  action="store_true",
+                        help="Gradient checkpointing: recompute activations on backward, ~4× less activation memory")
     parser.add_argument("--verify", action="store_true",
                         help="Pattern-learning verification: train on repeat-period data, "
                              "then generate completions to confirm learning")
@@ -568,6 +571,8 @@ def main() -> None:
 
     if args.verify:
         cfg = DWAConfig.pattern_test()
+    elif args.wide:
+        cfg = DWAConfig.full_wide()
     elif args.full:
         cfg = DWAConfig()
     elif args.large:
@@ -583,10 +588,15 @@ def main() -> None:
     else:
         cfg = DWAConfig.small()
 
-    # BF16 compute: auto-enable for --full (TPU v5e gets ~4× MXU throughput in BF16)
-    if args.bf16_compute or args.full:
+    # BF16 compute: auto-enable for --full/--wide (TPU v5e gets ~4× MXU throughput in BF16)
+    if args.bf16_compute or args.full or args.wide:
         cfg.compute_dtype = jnp.bfloat16
         print("[DWA] BF16 compute enabled: linear layers will run in bfloat16")
+
+    # Gradient checkpointing: recompute activations on backward pass
+    if args.remat:
+        cfg.remat = True
+        print("[DWA] Gradient checkpointing enabled: ~4× less activation memory, ~33% more FLOPs")
 
     tcfg = TrainConfig()
 
@@ -596,10 +606,16 @@ def main() -> None:
         tcfg.warmup_steps  = 300
         tcfg.gate_on_steps = 1500
         tcfg.batch_size    = 64
+    elif args.wide:
+        # d=512 uses ~2× more activation memory than d=256.
+        # With --remat batch=64 fits; without it keep batch=32 to be safe.
+        tcfg.batch_size        = 64 if args.remat else 32
+        tcfg.steps_per_window  = 64   # more steps/window → less compilation overhead
     elif args.full:
         # 4-way model parallel × 2-way data parallel on 8 devices.
         # Batch 64 → 32 per data replica; keeps logits [32,512,32000] at 2 GB.
-        tcfg.batch_size = 64
+        tcfg.batch_size       = 64
+        tcfg.steps_per_window = 64
     elif args.large:
         tcfg.total_steps   = tcfg.total_steps // 5
         tcfg.warmup_steps  = tcfg.warmup_steps // 5

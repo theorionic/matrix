@@ -62,15 +62,24 @@ class FFN(nnx.Module):
 
 class TransformerBlock(nnx.Module):
     def __init__(self, d_model: int, n_heads: int, ffn_mult: int, rngs: nnx.Rngs,
-                 compute_dtype=None) -> None:
+                 compute_dtype=None, remat: bool = False) -> None:
         self.norm1 = nnx.RMSNorm(d_model, rngs=rngs)
         self.attn = CausalSelfAttention(d_model, n_heads, rngs, compute_dtype)
         self.norm2 = nnx.RMSNorm(d_model, rngs=rngs)
         self.ffn = FFN(d_model, ffn_mult, rngs, compute_dtype)
+        self._remat = remat
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x + self.attn(self.norm1(x))
-        x = x + self.ffn(self.norm2(x))
+        if self._remat:
+            # Recompute activations during backward pass instead of storing them.
+            # Cuts activation memory ~4× at cost of ~33% more FLOPs.
+            attn_fn = jax.checkpoint(lambda h: self.attn(self.norm1(h)))
+            ffn_fn  = jax.checkpoint(lambda h: self.ffn(self.norm2(h)))
+            x = x + attn_fn(x)
+            x = x + ffn_fn(x)
+        else:
+            x = x + self.attn(self.norm1(x))
+            x = x + self.ffn(self.norm2(x))
         return x
 
 
@@ -84,7 +93,7 @@ class PartA(nnx.Module):
     def __init__(self, cfg: DWAConfig, rngs: nnx.Rngs) -> None:
         self.blocks = nnx.List([
             TransformerBlock(cfg.d_A, cfg.n_heads, cfg.ffn_mult, rngs,
-                             cfg.compute_dtype)
+                             cfg.compute_dtype, cfg.remat)
             for _ in range(cfg.n_layers_A)
         ])
         self.norm = nnx.RMSNorm(cfg.d_A, rngs=rngs)
@@ -105,7 +114,7 @@ class PartB(nnx.Module):
     def __init__(self, cfg: DWAConfig, rngs: nnx.Rngs) -> None:
         self.blocks = nnx.List([
             TransformerBlock(cfg.d_B, cfg.n_heads, cfg.ffn_mult, rngs,
-                             cfg.compute_dtype)
+                             cfg.compute_dtype, cfg.remat)
             for _ in range(cfg.n_layers_B)
         ])
         self.norm = nnx.RMSNorm(cfg.d_B, rngs=rngs)
