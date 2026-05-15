@@ -20,7 +20,7 @@ model:
   ffn_mult: 4
   vocab_size: 32000
   seq_len: 256
-  gamma_init: 0.01
+  gamma_init: 0.1
   bf16_pool: true
   compute_dtype: float32
   remat: false
@@ -33,7 +33,7 @@ train:
   lambda_gate_start: 1.0
   lambda_gate_end: 5.0
   lambda_sharpen_end: 10.0
-  lambda_util: 0.01
+  lambda_util: 0.1
   lambda_div: 0.01
   lambda_norm: 0.001
   lambda_sparse: 0.001
@@ -50,7 +50,7 @@ train:
   nan_emergency_stop: 5
   loss_spike_sigma: 5.0
   dead_vector_threshold: 1.0e-06
-  revival_interval_steps: 1000
+  revival_interval_steps: 500
 sharding:
   n_model: auto
 data:

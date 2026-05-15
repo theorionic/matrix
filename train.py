@@ -505,6 +505,7 @@ def _revive_dead_vectors(
     model: DWAModel,
     pool_ema: jnp.ndarray,
     cfg: DWAConfig,
+    tcfg: TrainConfig,
     step: int,
 ) -> int:
     """Replace pool vectors that have near-zero EMA usage.
@@ -516,7 +517,7 @@ def _revive_dead_vectors(
     Returns the number of vectors revived.
     """
     ema_np = np.array(pool_ema, dtype=np.float32)
-    dead_mask = ema_np < cfg.dead_vector_threshold
+    dead_mask = ema_np < tcfg.dead_vector_threshold
     n_dead = int(dead_mask.sum())
     if n_dead == 0:
         return 0
@@ -1056,14 +1057,16 @@ def train(run_cfg: RunConfig) -> None:
             + ("  [COLLAPSE RISK]" if collapse_flag else "")
         )
 
-        # 5. Dead vector revival (every revival_interval_steps steps)
-        if steps_done % tcfg.revival_interval_steps == 0:
-            n_revived = _revive_dead_vectors(model, pool_ema, cfg, steps_done)
+        # Text generation check every gen_every steps
+        prev_steps = steps_done - tcfg.steps_per_window
+
+        # 5. Dead vector revival (boundary-crossing check so it fires every
+        #    ~revival_interval_steps regardless of steps_per_window alignment)
+        if (steps_done // tcfg.revival_interval_steps) > (prev_steps // tcfg.revival_interval_steps):
+            n_revived = _revive_dead_vectors(model, pool_ema, cfg, tcfg, steps_done)
             if n_revived > 0:
                 print(f"[Safety] Revived {n_revived}/{cfg.N} dead pool vectors.")
 
-        # Text generation check every gen_every steps
-        prev_steps = steps_done - tcfg.steps_per_window
         if tokenizer is not None and (steps_done // gen_every) > (prev_steps // gen_every):
             _generate_text_sample(model, tokenizer, tcfg, steps_done)
 

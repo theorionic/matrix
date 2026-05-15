@@ -20,7 +20,7 @@ model:
   ffn_mult: 4
   vocab_size: 32000
   seq_len: 256
-  gamma_init: 0.01
+  gamma_init: 0.1
   bf16_pool: true
   compute_dtype: float32
   remat: false

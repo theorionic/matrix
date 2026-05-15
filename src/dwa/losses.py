@@ -12,7 +12,7 @@ def aux_losses(
     pool_keys: jnp.ndarray,   # [S, N, d_k]
     W: jnp.ndarray,           # [B, d_B, d_A] — assembled weight matrix
     W_base: jnp.ndarray,      # [d_B, d_A]
-    pool_ema: jnp.ndarray,    # [N] — EMA of per-vector utilization
+    soft_full: jnp.ndarray,   # [B, N_cands] — full pre-top-k soft distribution
     cfg: DWAConfig,
     tcfg: TrainConfig,
 ) -> dict[str, jnp.ndarray]:
@@ -22,11 +22,15 @@ def aux_losses(
     """
     B, k = alphas.shape
 
-    # L_util: prevent dead pool vectors
-    # Penalises vectors with low EMA usage: -Σ log(1 - exp(-β·ema_i))
-    beta = 10.0
-    safe_ema = jnp.clip(pool_ema, 1e-6, 1.0)
-    l_util = -jnp.log(1.0 - jnp.exp(-beta * safe_ema) + 1e-8).mean()
+    # L_util: maximise entropy of the full pre-top-k retrieval distribution.
+    # soft_full [B, N_cands] is the differentiable soft distribution returned
+    # by the retrieval module before the discrete top-k selection.  Its entropy
+    # has real gradient through W_Q / key_proj → drives diverse pool coverage.
+    # l_util = max_entropy - H(soft_full), so 0 = uniform, max = collapsed.
+    safe_soft = jnp.clip(soft_full, 1e-8, 1.0)
+    H = -(safe_soft * jnp.log(safe_soft)).sum(axis=-1).mean()
+    max_H = jnp.log(jnp.array(soft_full.shape[-1], dtype=jnp.float32))
+    l_util = max_H - H   # 0 when perfectly uniform, positive when collapsed
 
     # L_div: prevent key collapse among retrieved keys
     # Gather the S-aspect keys for retrieved vectors: [B, k, S, d_k]

@@ -171,7 +171,7 @@ class DWAModel(nnx.Module):
             pool_keys = key_cache                  # [S, N, d_k] — free
 
         # Retrieval — mesh enables model-axis all-gather inside retrieval
-        alphas, indices = self.retrieval(z, pool_keys, lambda_val, is_warmup, mesh=mesh)
+        alphas, indices, soft_full = self.retrieval(z, pool_keys, lambda_val, is_warmup, mesh=mesh)
 
         # Gather pool vectors [B, k_max, D]; uses distributed gather when pool is
         # model-sharded so we never all-gather the full 4 GB pool across devices.
@@ -229,6 +229,7 @@ class DWAModel(nnx.Module):
         metrics = {
             "alphas": alphas,
             "indices": indices,
+            "soft_full": soft_full,
             "W": W,
             "pool_keys": pool_keys_full,
             "W_base": W_base,
@@ -289,7 +290,7 @@ def forward_and_loss(
             metrics["pool_keys"],
             metrics["W"],
             metrics["W_base"],
-            model.pool_ema[...],
+            metrics["soft_full"],
             model.cfg,
             tcfg,
         )

@@ -126,11 +126,17 @@ class MultiAspectRetrieval(nnx.Module):
             )
 
         # ── Selection (warmup = softmax top-k; gate = sigmoid-gated) ─────────
+        # Both branches also return soft_full: the normalised distribution over
+        # ALL candidate vectors before top-k selection.  This is used by the
+        # utilisation loss to compute retrieval entropy — giving real gradient
+        # signal through W_Q / key_proj (unlike the old pool_ema-based formula
+        # which was a constant w.r.t. nnx.Param and had zero gradient).
         def warmup_select(_):
             scores, local_idx = jax.lax.top_k(s_i, cfg.k_max)       # [B, k_max]
             global_idx = jnp.take_along_axis(candidate_indices, local_idx, axis=1)
             alpha = jax.nn.softmax(scores / cfg.T, axis=-1)
-            return alpha, global_idx
+            soft_full = jax.nn.softmax(s_i / cfg.T, axis=-1)         # [B, N_cands]
+            return alpha, global_idx, soft_full
 
         def gate_select(_):
             g   = jax.nn.sigmoid(lambda_val * (s_i - self.tau[...]))
@@ -139,7 +145,7 @@ class MultiAspectRetrieval(nnx.Module):
             top_raw, local_idx = jax.lax.top_k(raw, cfg.k_max)
             global_idx = jnp.take_along_axis(candidate_indices, local_idx, axis=1)
             alpha = top_raw / (top_raw.sum(axis=-1, keepdims=True) + 1e-8)
-            return alpha, global_idx
+            return alpha, global_idx, raw                              # raw = full soft dist
 
-        alphas, indices = jax.lax.cond(is_warmup, warmup_select, gate_select, None)
-        return alphas, indices
+        alphas, indices, soft_full = jax.lax.cond(is_warmup, warmup_select, gate_select, None)
+        return alphas, indices, soft_full
