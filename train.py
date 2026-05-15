@@ -35,12 +35,12 @@ _jax_cfg.config.update = _safe_update
 
 import argparse
 import functools
-import glob
 import os
-import pickle
 import time
 from collections import deque
 from typing import NamedTuple
+
+import orbax.checkpoint as ocp
 
 import jax
 import jax.numpy as jnp
@@ -51,6 +51,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from src.dwa.assembly_pallas import compute_key_cache
 from src.dwa.config import DWAConfig, TrainConfig
 from src.dwa.model import DWAModel, forward_and_loss
+from src.dwa.run_config import (
+    CheckpointConfig, DataConfig, RunConfig, ShardingConfig,
+    load_config, save_config,
+)
 from src.dwa.schedule import PhaseScheduler
 from src.dwa.utils import ema_update
 
@@ -97,18 +101,18 @@ def _build_optimizer(model: DWAModel, tcfg: TrainConfig) -> nnx.Optimizer:
 # Multi-device mesh helpers
 # ---------------------------------------------------------------------------
 
-def _select_n_model(cfg: DWAConfig, n_devices: int) -> int:
+def _select_n_model(cfg: DWAConfig, n_devices: int, override: int | str = "auto") -> int:
     """
-    Choose model-parallel sharding degree so pool+Adam fits in ~8 GB/device.
+    Choose model-parallel sharding degree so pool+Adam fits in ~4 GB/device.
 
-    TPU v5e has 16 GB HBM; we target 8 GB for pool+Adam, leaving the rest
-    for activations and other params.  n_model must divide n_devices evenly.
+    override: "auto" → automatic; int → use that value (must divide n_devices).
     """
+    if override != "auto":
+        n = int(override)
+        assert n_devices % n == 0, f"n_model={n} must divide n_devices={n_devices}"
+        return n
     pool_and_adam_bytes = cfg.N * cfg.D * 4 * 3  # float32 params + m + v
-    # Conservative: each backward step also allocates up to 2 pool-sized gradient
-    # buffers ([N_local, D] each — one from key_cache, one from gather).  Keep
-    # pool+Adam below 4 GB/device so backward temporaries still fit in 16 GB.
-    target_bytes = 4 * 1024 ** 3  # 4 GB threshold (conservative)
+    target_bytes = 4 * 1024 ** 3  # 4 GB threshold
     for n_model in [1, 2, 4, 8]:
         if n_model > n_devices:
             break
@@ -116,7 +120,7 @@ def _select_n_model(cfg: DWAConfig, n_devices: int) -> int:
             continue
         if pool_and_adam_bytes / n_model <= target_bytes:
             return n_model
-    return n_devices  # shard across all devices as last resort
+    return n_devices
 
 
 def _build_mesh(devices, n_model: int) -> "Mesh":
@@ -332,20 +336,46 @@ class TinyStoriesLoader:
 
     def __init__(self, tokenizer, seq_len: int):
         from datasets import load_dataset
-        self.tokenizer = tokenizer
-        self.seq_len   = seq_len
-        dataset        = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
-        self._iterator = dataset.iter(batch_size=self.CHUNK_SIZE)
+        self.tokenizer      = tokenizer
+        self.seq_len        = seq_len
+        self._chunks_fetched = 0
+        dataset             = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+        self._iterator      = dataset.iter(batch_size=self.CHUNK_SIZE)
         self._buf: list[int] = []
         print(f"[DWA] TinyStories loader ready (chunk={self.CHUNK_SIZE} stories, seq_len={seq_len})")
 
     def _refill(self) -> None:
         chunk = next(self._iterator)          # {"text": ["Once upon a time ...", ...]}
+        self._chunks_fetched += 1
         eos   = self.tokenizer.eos_token_id
         for text in chunk["text"]:
             self._buf.extend(self.tokenizer.encode(text))
             if eos is not None:
                 self._buf.append(eos)
+
+    def state_dict(self) -> dict:
+        """Return serialisable state so the loader can be restored exactly."""
+        return {"chunks_fetched": self._chunks_fetched, "buf": list(self._buf)}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Fast-forward the HuggingFace iterator to the saved position."""
+        target = int(state["chunks_fetched"])
+        if target > 0:
+            print(f"[DWA] Loader fast-forward: skipping {target} chunks...")
+            for i in range(target):
+                try:
+                    next(self._iterator)      # discard — just advance iterator
+                except StopIteration:
+                    from datasets import load_dataset
+                    dataset = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+                    self._iterator = dataset.iter(batch_size=self.CHUNK_SIZE)
+                    self._chunks_fetched = 0
+                    break
+                if (i + 1) % 500 == 0:
+                    print(f"[DWA] Loader fast-forward: {i + 1}/{target} chunks...")
+        self._chunks_fetched = target
+        self._buf = list(state["buf"])
+        print(f"[DWA] Loader restored at chunk {target} ({len(self._buf)} tokens buffered).")
 
     def get_window(self, steps: int, batch_size: int) -> np.ndarray:
         """Return int32 array [steps, batch_size, seq_len] of real token IDs."""
@@ -516,6 +546,161 @@ def _revive_dead_vectors(
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint save / restore (orbax-based)
+# ---------------------------------------------------------------------------
+
+def _get_ckpt_manager(ckpt_dir: str, keep: int = 3) -> "ocp.CheckpointManager":
+    os.makedirs(ckpt_dir, exist_ok=True)
+    return ocp.CheckpointManager(
+        ckpt_dir,
+        options=ocp.CheckpointManagerOptions(max_to_keep=keep),
+    )
+
+
+def save_checkpoint(
+    ckpt_dir: str,
+    model: DWAModel,
+    optimizer: nnx.Optimizer,
+    pool_ema: jnp.ndarray,
+    steps_done: int,
+    rng: jax.Array,
+    loader: "TinyStoriesLoader | None",
+    keep: int = 3,
+) -> None:
+    """
+    Save a full training checkpoint.
+
+    JAX arrays (model params, opt state, pool EMA, RNG) go through orbax
+    StandardCheckpointer — which handles sharded arrays correctly.
+    The token buffer (variable-length Python list) is saved as a .npy file
+    alongside the orbax directory at ckpt_dir/{steps_done}/buf.npy.
+    """
+    mngr = _get_ckpt_manager(ckpt_dir, keep)
+
+    # Model parameters: State pytree of numpy arrays
+    model_np = jax.tree_util.tree_map(np.array, nnx.state(model, nnx.Param))
+
+    # Optimizer state: flatten to an indexed dict so we avoid optax custom types
+    # (MaskedState, etc.) that orbax cannot serialize as-is.
+    opt_leaves, _ = jax.tree_util.tree_flatten(optimizer.opt_state)
+    opt_dict = {f"{i:04d}": np.array(leaf) for i, leaf in enumerate(opt_leaves)}
+
+    save_item = {
+        "model":          model_np,
+        "opt":            opt_dict,
+        "meta": {
+            "opt_step":       np.array(int(optimizer.step[...]), dtype=np.int32),
+            "pool_ema":       np.array(pool_ema, dtype=np.float32),
+            "steps_done":     np.array(steps_done, dtype=np.int32),
+            "rng":            np.array(rng),
+            "chunks_fetched": np.array(loader._chunks_fetched if loader else 0, dtype=np.int32),
+        },
+    }
+
+    mngr.save(steps_done, args=ocp.args.StandardSave(save_item))
+    mngr.wait_until_finished()
+
+    # Save variable-length token buffer alongside the orbax step directory
+    if loader is not None and loader._buf:
+        buf_path = os.path.join(ckpt_dir, str(steps_done), "buf.npy")
+        np.save(buf_path, np.array(loader._buf, dtype=np.int32))
+
+    print(f"[Ckpt] Saved step {steps_done} → {ckpt_dir}/{steps_done}/")
+
+
+def _abstract_like(item):
+    """Recursively build an abstract (shape+dtype) version of a numpy pytree."""
+    return jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, item)
+
+
+def load_checkpoint(
+    ckpt_dir: str,
+    steps_done_target: int,
+    model: DWAModel,
+    optimizer: nnx.Optimizer,
+    cfg: DWAConfig,
+    mesh,
+) -> tuple[int, jax.Array, dict | None]:
+    """
+    Restore model, optimizer, and metadata from a checkpoint.
+
+    Handles model-parallel sharding: pool vectors are re-sharded to
+    P('model', None) when mesh has a 'model' dimension > 1.
+
+    Returns (steps_done, rng, loader_state_dict).
+    """
+    mngr = _get_ckpt_manager(ckpt_dir)
+
+    # Build abstract reference from the current (freshly-initialised) model
+    model_np   = jax.tree_util.tree_map(np.array, nnx.state(model, nnx.Param))
+    opt_leaves, opt_treedef = jax.tree_util.tree_flatten(optimizer.opt_state)
+    opt_dict_ref = {f"{i:04d}": np.array(leaf) for i, leaf in enumerate(opt_leaves)}
+
+    abstract = {
+        "model": _abstract_like(model_np),
+        "opt":   _abstract_like(opt_dict_ref),
+        "meta": {
+            "opt_step":       jax.ShapeDtypeStruct((), np.int32),
+            "pool_ema":       jax.ShapeDtypeStruct((cfg.N,), np.float32),
+            "steps_done":     jax.ShapeDtypeStruct((), np.int32),
+            "rng":            _abstract_like(np.array(jax.random.PRNGKey(0))),
+            "chunks_fetched": jax.ShapeDtypeStruct((), np.int32),
+        },
+    }
+
+    restored = mngr.restore(steps_done_target, args=ocp.args.StandardRestore(abstract))
+
+    # --- Restore model parameters ---
+    n_model = mesh.shape.get("model", 1) if mesh is not None else 1
+    pool_sharding = NamedSharding(mesh, P("model", None)) if (mesh is not None and n_model > 1) else None
+
+    if pool_sharding is not None:
+        # Re-shard pool vectors without materialising the full array on one device:
+        # slice each device's rows and put them directly.
+        pool_np  = np.array(restored["model"]["pool"]["vectors"])  # host numpy [N, D]
+        N_local  = pool_np.shape[0] // n_model
+        idx_map  = pool_sharding.addressable_devices_indices_map(pool_np.shape)
+        per_dev  = []
+        for dev in pool_sharding.addressable_devices:
+            rows = idx_map[dev][0]
+            shard = jax.device_put(
+                jnp.array(pool_np[rows], dtype=model.pool.vectors[...].dtype), dev
+            )
+            per_dev.append(shard)
+        sharded_pool = jax.make_array_from_single_device_arrays(
+            pool_np.shape, pool_sharding, per_dev
+        )
+        # Update model params without pool first, then fix pool
+        nnx.update(model, restored["model"])
+        model.pool.vectors[...] = sharded_pool
+    else:
+        nnx.update(model, restored["model"])
+
+    # --- Restore optimizer state ---
+    restored_opt_leaves = [
+        jnp.array(restored["opt"][f"{i:04d}"]) for i in range(len(opt_leaves))
+    ]
+    optimizer.opt_state = jax.tree_util.tree_unflatten(opt_treedef, restored_opt_leaves)
+    optimizer.step[...] = jnp.array(restored["meta"]["opt_step"], dtype=jnp.uint32)
+
+    # --- Pool EMA ---
+    pool_ema = jnp.array(restored["meta"]["pool_ema"])
+
+    # --- RNG + steps ---
+    rng         = jnp.array(restored["meta"]["rng"])
+    steps_done  = int(restored["meta"]["steps_done"])
+
+    # --- Loader state (buf + chunks_fetched) ---
+    chunks_fetched = int(restored["meta"]["chunks_fetched"])
+    buf_path = os.path.join(ckpt_dir, str(steps_done_target), "buf.npy")
+    buf = list(np.load(buf_path).tolist()) if os.path.exists(buf_path) else []
+    loader_state = {"chunks_fetched": chunks_fetched, "buf": buf}
+
+    print(f"[Ckpt] Loaded step {steps_done} from {ckpt_dir}/{steps_done_target}/")
+    return steps_done, rng, loader_state, pool_ema
+
+
+# ---------------------------------------------------------------------------
 # Pallas probe — check at startup whether the kernel compiles successfully
 # ---------------------------------------------------------------------------
 
@@ -622,22 +807,50 @@ def _print_param_table(model: DWAModel) -> None:
 # Main training loop
 # ---------------------------------------------------------------------------
 
-def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False,
-          tokenizer=None, gen_every: int = 100) -> None:
+def train(run_cfg: RunConfig) -> None:
+    """
+    Main training loop.  Accepts a fully-resolved RunConfig.
+
+    All hyperparameters, sharding strategy, data source, and checkpoint
+    settings come from run_cfg.  Build one with load_config() or assemble
+    it manually from DWAConfig / TrainConfig / ShardingConfig etc.
+    """
+    cfg  = run_cfg.model
+    tcfg = run_cfg.train
+
+    # --- Data source setup (before model build so vocab_size is set) ---
+    tokenizer   = None
+    use_pattern = False
+    if run_cfg.data.source == "tiny_stories":
+        from transformers import GPT2TokenizerFast
+        tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+        # Pad to the nearest multiple of 64 ≥ 50257 so vocab_parallel sharding
+        # divides evenly for any n_model in {1,2,4,8}.
+        cfg.vocab_size = ((tokenizer.vocab_size + 63) // 64) * 64   # 50304
+        print(f"[DWA] TinyStories mode: GPT-2 tokenizer, padded vocab_size={cfg.vocab_size}")
+    elif run_cfg.data.source == "pattern":
+        use_pattern = True
+
+    gen_every  = run_cfg.data.gen_every
+    ckpt_dir   = run_cfg.checkpoint.dir
+    ckpt_every = run_cfg.checkpoint.every
+    resume     = run_cfg.checkpoint.resume
+
     devices = jax.devices()
     n_devices = len(devices)
     device_kind = devices[0].device_kind
 
-    # --- Mesh selection ---
-    # Use a 2D ('data', 'model') mesh.  n_model shards the pool to keep
-    # pool+Adam within ~8 GB/device on 16 GB v5e chips.
-    n_model = _select_n_model(cfg, n_devices)
+    # --- Mesh: 2D (data × model) ---
+    n_model = _select_n_model(cfg, n_devices, run_cfg.sharding.n_model)
     n_data = n_devices // n_model
     mesh = _build_mesh(devices, n_model)
 
+    sharding_src = ("auto" if run_cfg.sharding.n_model == "auto"
+                    else f"explicit n_model={run_cfg.sharding.n_model}")
     print(f"[DWA] Training on {n_devices}× {device_kind}")
     print(f"[DWA] Mesh: {n_data}×data  {n_model}×model  "
-          f"(pool+Adam/device ≈ {cfg.N * cfg.D * 4 * 3 / n_model / 1e9:.1f} GB)")
+          f"(pool+Adam/device ≈ {cfg.N * cfg.D * 4 * 3 / n_model / 1e9:.1f} GB)"
+          f"  [{sharding_src}]")
     print(f"[DWA] Model config: N={cfg.N}, D={cfg.D}, d_A={cfg.d_A}, r={cfg.r}, "
           f"layers={cfg.n_layers_A}+{cfg.n_layers_B}, vocab={cfg.vocab_size}")
 
@@ -689,12 +902,31 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False,
             )
         return compiled_fns[key]
 
-    n_windows = tcfg.total_steps // tcfg.steps_per_window
+    n_windows  = tcfg.total_steps // tcfg.steps_per_window
     steps_done = 0
+    start_window = 0
     rng = jax.random.PRNGKey(tcfg.seed + 1)
+
+    # --- Resume from checkpoint ---
+    if resume and ckpt_dir:
+        mngr_probe = _get_ckpt_manager(ckpt_dir)
+        latest = mngr_probe.latest_step()
+        if latest is not None:
+            steps_done, rng, loader_state, pool_ema = load_checkpoint(
+                ckpt_dir, latest, model, optimizer, cfg, mesh
+            )
+            model.pool_ema[...] = pool_ema
+            start_window = steps_done // tcfg.steps_per_window
+            if loader is not None and loader_state is not None:
+                loader.load_state_dict(loader_state)
+            print(f"[Ckpt] Resuming from step {steps_done} (window {start_window}/{n_windows})")
+        else:
+            print(f"[Ckpt] No checkpoint in '{ckpt_dir}', starting fresh.")
 
     print(f"[DWA] Training for {tcfg.total_steps} steps "
           f"({n_windows} windows × {tcfg.steps_per_window} steps)")
+    if ckpt_dir:
+        print(f"[DWA] Checkpointing: dir='{ckpt_dir}'  every={ckpt_every} steps  keep=3")
     print(f"[DWA] Safety: grad_clip={tcfg.grad_clip_norm}  "
           f"nan_stop={tcfg.nan_emergency_stop}w  "
           f"spike_sigma={tcfg.loss_spike_sigma}σ  "
@@ -709,7 +941,7 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False,
     _loss_window: deque = deque(maxlen=50)   # rolling buffer for spike detection
 
     t0 = time.time()
-    for window_idx in range(n_windows):
+    for window_idx in range(start_window, n_windows):
         start_step = window_idx * tcfg.steps_per_window
         phase = scheduler.get_phase(start_step)
         is_warmup = scheduler.is_warmup(start_step)
@@ -835,6 +1067,14 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False,
         if tokenizer is not None and (steps_done // gen_every) > (prev_steps // gen_every):
             _generate_text_sample(model, tokenizer, tcfg, steps_done)
 
+        # Checkpoint save (boundary crossing check avoids double-saves at resume)
+        if ckpt_dir and ckpt_every > 0 and (steps_done // ckpt_every) > (prev_steps // ckpt_every):
+            save_checkpoint(ckpt_dir, model, optimizer, pool_ema, steps_done, rng, loader)
+            # Dump effective config once, alongside the first checkpoint
+            cfg_out = os.path.join(ckpt_dir, "effective_config.yaml")
+            if not os.path.exists(cfg_out):
+                save_config(run_cfg, cfg_out)
+
         # Update model's pool EMA (non-trainable variable)
         model.pool_ema[...] = pool_ema
 
@@ -861,113 +1101,166 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False,
 # CLI
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train DWA model")
-    parser.add_argument("--full",   action="store_true", help="Full-scale config (~13GB/device)")
-    parser.add_argument("--wide",   action="store_true", help="Full pool + d=512 for 3-4× better MXU fill")
-    parser.add_argument("--large",  action="store_true", help="Large config (2× medium pool, 8 layers)")
-    parser.add_argument("--medium", action="store_true", help="Medium config (fits 16GB/device)")
-    parser.add_argument("--mxu",    action="store_true", help="MXU-aligned config: r=128, 128×128 assembly matmuls")
-    parser.add_argument("--remat",  action="store_true",
-                        help="Gradient checkpointing: recompute activations on backward, ~4× less activation memory")
-    parser.add_argument("--verify", action="store_true",
-                        help="Pattern-learning verification: train on repeat-period data, "
-                             "then generate completions to confirm learning")
-    parser.add_argument("--bf16",         action="store_true", help="Store pool in bfloat16 (halves gather bandwidth)")
-    parser.add_argument("--bf16-compute", action="store_true", default=False,
-                        help="Run all linear layers in bfloat16 (4× MXU throughput; auto-enabled for --full)")
-    parser.add_argument("--steps", type=int, default=None, help="Override total_steps")
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--steps-per-window", type=int, default=None)
-    parser.add_argument("--tiny-stories", action="store_true",
-                        help="Train on roneneldan/TinyStories with GPT-2 tokenizer")
-    parser.add_argument("--gen-every", type=int, default=100,
-                        help="Generate a text sample every N steps (TinyStories mode only)")
-    args = parser.parse_args()
+def _build_run_config_from_args(args) -> RunConfig:
+    """
+    Build a RunConfig from parsed CLI arguments.
 
-    if args.verify:
-        cfg = DWAConfig.pattern_test()
-    elif args.wide:
-        cfg = DWAConfig.full_wide()
-    elif args.full:
-        cfg = DWAConfig()
-    elif args.large:
-        cfg = DWAConfig.large()
-        if args.bf16:
-            cfg.bf16_pool = True
-    elif args.mxu:
-        cfg = DWAConfig.medium_mxu(bf16=args.bf16)
-    elif args.medium:
-        cfg = DWAConfig.medium()
-        if args.bf16:
-            cfg.bf16_pool = True
+    --config PATH is the base; every other flag is an override on top.
+    Old preset flags (--full, --medium, …) still work when --config is absent.
+    """
+    # --- Base config ---
+    if args.config:
+        run_cfg = load_config(args.config)
+        print(f"[DWA] Loaded config from '{args.config}' (name={run_cfg.name!r})")
     else:
-        cfg = DWAConfig.small()
+        # Build from preset flags (backward compat)
+        if args.verify:
+            cfg_model = DWAConfig.pattern_test()
+        elif args.wide:
+            cfg_model = DWAConfig.full_wide()
+        elif args.full:
+            cfg_model = DWAConfig()
+        elif args.large:
+            cfg_model = DWAConfig.large()
+        elif args.mxu:
+            cfg_model = DWAConfig.medium_mxu(bf16=args.bf16)
+        elif args.medium:
+            cfg_model = DWAConfig.medium()
+        else:
+            cfg_model = DWAConfig.small()
 
-    # BF16 compute: auto-enable for --full/--wide (TPU v5e gets ~4× MXU throughput in BF16)
-    if args.bf16_compute or args.full or args.wide:
-        cfg.compute_dtype = jnp.bfloat16
+        tcfg = TrainConfig()
+        if args.verify:
+            tcfg.total_steps, tcfg.warmup_steps, tcfg.gate_on_steps = 6000, 300, 1500
+            tcfg.batch_size = 64
+        elif args.wide:
+            tcfg.batch_size, tcfg.steps_per_window = (64 if args.remat else 32), 128
+        elif args.full:
+            tcfg.batch_size, tcfg.steps_per_window = 32, 128
+        elif args.large:
+            tcfg.total_steps   //= 5
+            tcfg.warmup_steps  //= 5
+            tcfg.gate_on_steps //= 5
+            tcfg.batch_size     = 128
+        elif args.mxu or args.medium:
+            tcfg.total_steps   //= 5
+            tcfg.warmup_steps  //= 5
+            tcfg.gate_on_steps //= 5
+            tcfg.batch_size     = 128
+        else:
+            tcfg.total_steps   //= 10
+            tcfg.warmup_steps  //= 10
+            tcfg.gate_on_steps //= 10
+            tcfg.batch_size     = 16
+
+        source = "pattern" if args.verify else ("tiny_stories" if args.tiny_stories else "random")
+        run_cfg = RunConfig(
+            model=cfg_model,
+            train=tcfg,
+            sharding=ShardingConfig(n_model="auto"),
+            data=DataConfig(source=source, gen_every=args.gen_every),
+            checkpoint=CheckpointConfig(
+                dir=args.ckpt_dir, every=args.ckpt_every, resume=args.resume,
+            ),
+        )
+
+    # --- Per-flag overrides (apply regardless of --config or preset) ---
+    if args.bf16:
+        run_cfg.model.bf16_pool = True
+    if args.bf16_compute or (not args.config and (args.full or args.wide)):
+        run_cfg.model.compute_dtype = jnp.bfloat16
         print("[DWA] BF16 compute enabled: linear layers will run in bfloat16")
-
-    # Gradient checkpointing: recompute activations on backward pass
     if args.remat:
-        cfg.remat = True
+        run_cfg.model.remat = True
         print("[DWA] Gradient checkpointing enabled: ~4× less activation memory, ~33% more FLOPs")
-
-    tcfg = TrainConfig()
-
-    if args.verify:
-        # Train on tiny vocab pattern data; 6000 steps gets loss well below random
-        tcfg.total_steps   = 6000
-        tcfg.warmup_steps  = 300
-        tcfg.gate_on_steps = 1500
-        tcfg.batch_size    = 64
-    elif args.wide:
-        # vocab_parallel shards lm_head over model axis (V/4 per device).
-        # Logits freed: 4 GB → 1 GB.  Attn [B_local,8,2048,2048] is the binding
-        # constraint at seq=2048; remat halves the cost.
-        tcfg.batch_size        = 64 if args.remat else 32
-        tcfg.steps_per_window  = 128
-    elif args.full:
-        # 4-way model parallel × 2-way data parallel on 8 devices.
-        # vocab_parallel frees ~3 GB of logit memory (4 GB → 1 GB at B_local=16).
-        # Attn [16,4,2048,2048]×12 = 6 GB remains the binding constraint;
-        # batch=32 (16/device) fits comfortably with that freed headroom.
-        tcfg.batch_size       = 32
-        tcfg.steps_per_window = 128
-    elif args.large:
-        tcfg.total_steps   = tcfg.total_steps // 5
-        tcfg.warmup_steps  = tcfg.warmup_steps // 5
-        tcfg.gate_on_steps = tcfg.gate_on_steps // 5
-        tcfg.batch_size    = 128
-    elif args.mxu or args.medium:
-        tcfg.total_steps   = tcfg.total_steps // 5
-        tcfg.warmup_steps  = tcfg.warmup_steps // 5
-        tcfg.gate_on_steps = tcfg.gate_on_steps // 5
-        tcfg.batch_size    = 128
-    else:
-        tcfg.total_steps   = tcfg.total_steps // 10
-        tcfg.warmup_steps  = tcfg.warmup_steps // 10
-        tcfg.gate_on_steps = tcfg.gate_on_steps // 10
-        tcfg.batch_size    = 16
-
-    if args.steps is not None:
-        tcfg.total_steps = args.steps
-    if args.batch_size is not None:
-        tcfg.batch_size = args.batch_size
-    if args.steps_per_window is not None:
-        tcfg.steps_per_window = args.steps_per_window
-
-    tokenizer = None
     if args.tiny_stories:
-        from transformers import GPT2TokenizerFast
-        tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-        # Pad vocab to the nearest multiple of 64 ≥ GPT-2's 50257 so that
-        # vocab_parallel sharding divides evenly for any n_model in {1,2,4,8}.
-        cfg.vocab_size = ((tokenizer.vocab_size + 63) // 64) * 64  # 50304
-        print(f"[DWA] TinyStories mode: GPT-2 tokenizer, padded vocab_size={cfg.vocab_size}")
+        run_cfg.data.source = "tiny_stories"
+    if args.n_model is not None:
+        run_cfg.sharding.n_model = args.n_model if args.n_model == "auto" else int(args.n_model)
 
-    train(cfg, tcfg, use_pattern=args.verify, tokenizer=tokenizer, gen_every=args.gen_every)
+    # Scalar overrides (highest priority)
+    if args.steps is not None:
+        run_cfg.train.total_steps = args.steps
+    if args.batch_size is not None:
+        run_cfg.train.batch_size = args.batch_size
+    if args.steps_per_window is not None:
+        run_cfg.train.steps_per_window = args.steps_per_window
+    if args.gen_every != 100:            # non-default means user explicitly set it
+        run_cfg.data.gen_every = args.gen_every
+    if args.ckpt_dir:
+        run_cfg.checkpoint.dir = args.ckpt_dir
+    if args.ckpt_every != 1000:
+        run_cfg.checkpoint.every = args.ckpt_every
+    if args.resume:
+        run_cfg.checkpoint.resume = True
+
+    return run_cfg
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Train DWA model",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python train.py --config configs/full.yaml
+  python train.py --config configs/medium.yaml --steps 50000 --ckpt-dir ckpts
+  python train.py --config configs/small.yaml --n-model 1
+  python train.py --full --bf16                         (legacy preset flags)
+  python train.py --tiny-stories --ckpt-dir ckpts --resume
+        """,
+    )
+
+    # --- Config file ---
+    parser.add_argument("--config", type=str, default="",
+                        help="Path to a YAML config file (base for all settings)")
+
+    # --- Preset flags (backward compat; ignored when --config is given) ---
+    presets = parser.add_argument_group("preset configs (ignored when --config is used)")
+    presets.add_argument("--full",   action="store_true", help="Full-scale config")
+    presets.add_argument("--wide",   action="store_true", help="Full pool + d=512")
+    presets.add_argument("--large",  action="store_true", help="2× medium pool, 8 layers")
+    presets.add_argument("--medium", action="store_true", help="Medium config (16GB/device)")
+    presets.add_argument("--mxu",    action="store_true", help="MXU-aligned: r=128")
+    presets.add_argument("--verify", action="store_true", help="Pattern-learning verification run")
+
+    # --- Model overrides ---
+    model_g = parser.add_argument_group("model overrides")
+    model_g.add_argument("--bf16",         action="store_true", help="Pool in bfloat16")
+    model_g.add_argument("--bf16-compute", action="store_true", default=False,
+                         help="Linear layers in bfloat16 (~4× MXU throughput)")
+    model_g.add_argument("--remat",        action="store_true",
+                         help="Gradient checkpointing (~4× less activation memory)")
+
+    # --- Sharding override ---
+    parser.add_argument("--n-model", type=str, default=None, metavar="N|auto",
+                        help="Model-parallel degree: integer (1/2/4/8) or 'auto' (default)")
+
+    # --- Training overrides ---
+    train_g = parser.add_argument_group("training overrides")
+    train_g.add_argument("--steps",            type=int, default=None)
+    train_g.add_argument("--batch-size",       type=int, default=None)
+    train_g.add_argument("--steps-per-window", type=int, default=None)
+
+    # --- Data ---
+    data_g = parser.add_argument_group("data")
+    data_g.add_argument("--tiny-stories", action="store_true",
+                        help="Train on roneneldan/TinyStories with GPT-2 tokenizer")
+    data_g.add_argument("--gen-every", type=int, default=100,
+                        help="Generate text sample every N steps (default: 100)")
+
+    # --- Checkpoint ---
+    ckpt_g = parser.add_argument_group("checkpointing")
+    ckpt_g.add_argument("--ckpt-dir",   type=str, default="",
+                        help="Directory to save checkpoints")
+    ckpt_g.add_argument("--ckpt-every", type=int, default=1000,
+                        help="Save checkpoint every N steps (default: 1000)")
+    ckpt_g.add_argument("--resume",     action="store_true",
+                        help="Resume from latest checkpoint in --ckpt-dir")
+
+    args = parser.parse_args()
+    run_cfg = _build_run_config_from_args(args)
+    train(run_cfg)
 
 
 if __name__ == "__main__":

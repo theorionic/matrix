@@ -1,0 +1,63 @@
+name: small
+model:
+  D: 2048
+  N: 512
+  use_ivf: true
+  C: 128
+  m: 8
+  d_A: 64
+  d_B: 64
+  r: 4
+  k_max: 8
+  S: 2
+  d_k: 32
+  T: 1.0
+  n_heads: 2
+  n_kv_heads: 1
+  use_rope: true
+  n_layers_A: 1
+  n_layers_B: 1
+  ffn_mult: 4
+  vocab_size: 1000
+  seq_len: 64
+  gamma_init: 0.01
+  bf16_pool: true
+  compute_dtype: float32
+  remat: false
+  use_flash_attn: false
+  vocab_parallel: true
+train:
+  warmup_steps: 100
+  gate_on_steps: 1000
+  total_steps: 10000
+  lambda_gate_start: 1.0
+  lambda_gate_end: 5.0
+  lambda_sharpen_end: 10.0
+  lambda_util: 0.01
+  lambda_div: 0.01
+  lambda_norm: 0.001
+  lambda_sparse: 0.001
+  lr_pool: 3.0e-05
+  lr_parts: 0.0001
+  lr_retrieval: 0.0001
+  lr_threshold: 0.001
+  batch_size: 16
+  steps_per_window: 32
+  seed: 42
+  lr_warmup_steps: 500
+  ema_decay: 0.99
+  grad_clip_norm: 1.0
+  nan_emergency_stop: 5
+  loss_spike_sigma: 5.0
+  dead_vector_threshold: 1.0e-06
+  revival_interval_steps: 1000
+sharding:
+  n_model: auto
+data:
+  source: random
+  gen_every: 100
+checkpoint:
+  dir: ''
+  every: 1000
+  resume: false
+  keep: 3

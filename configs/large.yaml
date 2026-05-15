@@ -1,0 +1,63 @@
+name: large
+model:
+  D: 4096
+  N: 32768
+  use_ivf: true
+  C: 128
+  m: 8
+  d_A: 128
+  d_B: 128
+  r: 12
+  k_max: 16
+  S: 4
+  d_k: 64
+  T: 1.0
+  n_heads: 4
+  n_kv_heads: 1
+  use_rope: true
+  n_layers_A: 8
+  n_layers_B: 8
+  ffn_mult: 4
+  vocab_size: 32000
+  seq_len: 256
+  gamma_init: 0.01
+  bf16_pool: true
+  compute_dtype: float32
+  remat: false
+  use_flash_attn: false
+  vocab_parallel: true
+train:
+  warmup_steps: 200
+  gate_on_steps: 2000
+  total_steps: 20000
+  lambda_gate_start: 1.0
+  lambda_gate_end: 5.0
+  lambda_sharpen_end: 10.0
+  lambda_util: 0.01
+  lambda_div: 0.01
+  lambda_norm: 0.001
+  lambda_sparse: 0.001
+  lr_pool: 3.0e-05
+  lr_parts: 0.0001
+  lr_retrieval: 0.0001
+  lr_threshold: 0.001
+  batch_size: 128
+  steps_per_window: 32
+  seed: 42
+  lr_warmup_steps: 500
+  ema_decay: 0.99
+  grad_clip_norm: 1.0
+  nan_emergency_stop: 5
+  loss_spike_sigma: 5.0
+  dead_vector_threshold: 1.0e-06
+  revival_interval_steps: 1000
+sharding:
+  n_model: auto
+data:
+  source: random
+  gen_every: 100
+checkpoint:
+  dir: ''
+  every: 1000
+  resume: false
+  keep: 3
