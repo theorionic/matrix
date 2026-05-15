@@ -71,7 +71,7 @@ def _build_optimizer(model: DWAModel, tcfg: TrainConfig) -> nnx.Optimizer:
             return "pool"
         if "tau" in p or "gamma" in p:
             return "threshold"
-        if "W_Q" in p or "aspect_weights" in p:
+        if "W_Q" in p or "aspect_weights" in p or "centroids" in p:
             return "retrieval"
         return "parts"
 
@@ -610,12 +610,12 @@ def main() -> None:
         # d=512 uses ~2× more activation memory than d=256.
         # With --remat batch=64 fits; without it keep batch=32 to be safe.
         tcfg.batch_size        = 64 if args.remat else 32
-        tcfg.steps_per_window  = 64   # more steps/window → less compilation overhead
+        tcfg.steps_per_window  = 128  # many steps/window → minimal pool projection overhead
     elif args.full:
         # 4-way model parallel × 2-way data parallel on 8 devices.
         # Batch 64 → 32 per data replica; keeps logits [32,512,32000] at 2 GB.
         tcfg.batch_size       = 64
-        tcfg.steps_per_window = 64
+        tcfg.steps_per_window = 128
     elif args.large:
         tcfg.total_steps   = tcfg.total_steps // 5
         tcfg.warmup_steps  = tcfg.warmup_steps // 5

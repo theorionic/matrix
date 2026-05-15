@@ -8,7 +8,7 @@ from .assembly import WeightAssembler
 from .assembly_pallas import assemble_jax, pallas_assemble, shard_pallas_assemble
 from .config import DWAConfig, TrainConfig
 from .losses import aux_losses, task_loss
-from .parts import PartA, PartB
+from .parts import PartA, PartB, precompute_rope_freqs
 from .pool import VectorPool
 from .retrieval import MultiAspectRetrieval
 
@@ -87,14 +87,22 @@ class DWAModel(nnx.Module):
         """
         cfg = self.cfg
 
-        # Sinusoidal position encoding
+        T = input_ids.shape[1]
+
+        # Rotary Positional Embeddings or Sinusoidal
+        if cfg.use_rope:
+            cos, sin = precompute_rope_freqs(T, cfg.d_A // cfg.n_heads)
+            pos = None
+        else:
+            cos = sin = None
+            pos = _sinusoidal_pos_enc(T, cfg.d_A)
+
         x = self.embed(input_ids)           # [B, T, d_A]
-        T = x.shape[1]
-        pos = _sinusoidal_pos_enc(T, cfg.d_A)
-        x = x + pos[None]
+        if pos is not None:
+            x = x + pos[None]
 
         # Part A
-        h_A = self.part_a(x)                # [B, T, d_A]
+        h_A = self.part_a(x, cos, sin, mesh)                # [B, T, d_A]
         z = h_A.mean(axis=1)               # [B, d_A] — retrieval query
 
         # Key cache: use provided cache or compute on-the-fly
@@ -146,7 +154,7 @@ class DWAModel(nnx.Module):
             h_mid = self.assembler.layer_norm(h_mid_no_ln)
 
         # Part B
-        h_out = self.part_b(h_mid)          # [B, T, d_B]
+        h_out = self.part_b(h_mid, cos, sin, mesh)          # [B, T, d_B]
         logits = self.lm_head(h_out)        # [B, T, vocab_size]
 
         # aux_losses indexes pool_keys with global indices; ensure it is fully

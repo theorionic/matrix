@@ -10,6 +10,11 @@ class DWAConfig:
     D: int = 16384     # pool vector dim
     N: int = 65536     # pool size
 
+    # IVF retrieval
+    use_ivf: bool = True # Use two-stage IVF retrieval
+    C: int = 128       # number of centroids
+    m: int = 8         # number of clusters to search
+
     # Transformer hidden dims
     d_A: int = 256     # Part A hidden dim
     d_B: int = 256     # Part B hidden dim (must equal d_A for residual)
@@ -25,21 +30,24 @@ class DWAConfig:
 
     # Transformer architecture
     n_heads: int = 4           # attention heads in Part A and B
+    n_kv_heads: int = 1        # KV heads (GQA); 1 = MQA, n_heads = MHA
+    use_rope: bool = True      # Use Rotary Positional Embeddings
     n_layers_A: int = 6        # Transformer layers in Part A
     n_layers_B: int = 6        # Transformer layers in Part B
     ffn_mult: int = 4          # FFN hidden = ffn_mult * d
 
     # Vocabulary / sequence
     vocab_size: int = 32000
-    seq_len: int = 512
+    seq_len: int = 2048
 
     # Assembly init
     gamma_init: float = 0.01   # LoRA-style residual scalar init
 
     # Memory / precision
-    bf16_pool: bool = False  # store pool vectors in bfloat16 (halves gather bandwidth)
+    bf16_pool: bool = True   # store pool vectors in bfloat16 (halves gather bandwidth)
     compute_dtype: Any = None  # None=float32; set to jnp.bfloat16 for ~4× MXU throughput
     remat: bool = False        # gradient checkpointing: recompute activations, cut ~4× activation memory
+    use_flash_attn: bool = False  # Pallas flash attention (hits VMEM limit inside scan+vjp; inference-only)
 
     def __post_init__(self):
         needed = self.d_B * self.r + self.r * self.d_A + self.d_B
@@ -49,6 +57,13 @@ class DWAConfig:
         )
         assert self.d_A == self.d_B, "d_A must equal d_B for the residual connection"
         assert self.d_A % self.n_heads == 0, "d_A must be divisible by n_heads"
+        assert self.n_heads % self.n_kv_heads == 0, (
+            f"n_heads={self.n_heads} must be divisible by n_kv_heads={self.n_kv_heads}"
+        )
+        if self.use_ivf:
+            assert self.N % self.C == 0, (
+                f"N={self.N} must be divisible by C={self.C} for IVF equal-size buckets"
+            )
 
     @classmethod
     def small(cls) -> "DWAConfig":
@@ -105,8 +120,9 @@ class DWAConfig:
         return cls(
             D=32768, N=32768, d_A=512, d_B=512, r=24,
             k_max=16, S=4, d_k=64,
-            n_heads=8, n_layers_A=6, n_layers_B=6,
-            ffn_mult=4, vocab_size=32000, seq_len=512,
+            n_heads=8, n_kv_heads=1, n_layers_A=6, n_layers_B=6,
+            ffn_mult=4, vocab_size=32000, seq_len=2048,
+            bf16_pool=True,
         )
 
     @classmethod
