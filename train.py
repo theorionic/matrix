@@ -558,7 +558,9 @@ def main() -> None:
     parser.add_argument("--verify", action="store_true",
                         help="Pattern-learning verification: train on repeat-period data, "
                              "then generate completions to confirm learning")
-    parser.add_argument("--bf16",   action="store_true", help="Store pool in bfloat16 (halves gather bandwidth)")
+    parser.add_argument("--bf16",         action="store_true", help="Store pool in bfloat16 (halves gather bandwidth)")
+    parser.add_argument("--bf16-compute", action="store_true", default=False,
+                        help="Run all linear layers in bfloat16 (4× MXU throughput; auto-enabled for --full)")
     parser.add_argument("--steps", type=int, default=None, help="Override total_steps")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--steps-per-window", type=int, default=None)
@@ -580,6 +582,11 @@ def main() -> None:
             cfg.bf16_pool = True
     else:
         cfg = DWAConfig.small()
+
+    # BF16 compute: auto-enable for --full (TPU v5e gets ~4× MXU throughput in BF16)
+    if args.bf16_compute or args.full:
+        cfg.compute_dtype = jnp.bfloat16
+        print("[DWA] BF16 compute enabled: linear layers will run in bfloat16")
 
     tcfg = TrainConfig()
 

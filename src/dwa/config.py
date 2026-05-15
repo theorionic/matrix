@@ -1,6 +1,7 @@
 """DWAConfig and TrainConfig — single source of truth for all hyperparameters."""
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -37,6 +38,7 @@ class DWAConfig:
 
     # Memory / precision
     bf16_pool: bool = False  # store pool vectors in bfloat16 (halves gather bandwidth)
+    compute_dtype: Any = None  # None=float32; set to jnp.bfloat16 for ~4× MXU throughput
 
     def __post_init__(self):
         needed = self.d_B * self.r + self.r * self.d_A + self.d_B

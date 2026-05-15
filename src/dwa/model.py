@@ -62,7 +62,8 @@ class DWAModel(nnx.Module):
         self.pool = VectorPool(cfg, rngs, pool_vectors=pool_vectors)
         self.retrieval = MultiAspectRetrieval(cfg, rngs)
         self.assembler = WeightAssembler(cfg, rngs)
-        self.lm_head = nnx.Linear(cfg.d_B, cfg.vocab_size, use_bias=False, rngs=rngs)
+        self.lm_head = nnx.Linear(cfg.d_B, cfg.vocab_size, use_bias=False,
+                                   dtype=cfg.compute_dtype, rngs=rngs)
         # Non-trainable EMA of per-vector utilization [N]
         self.pool_ema = nnx.Variable(jnp.zeros(cfg.N))
 
