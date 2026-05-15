@@ -44,6 +44,64 @@ def _distributed_gather(pool_vecs, indices, mesh):
     )(pool_vecs, indices)
 
 
+def _vocab_parallel_cross_entropy(
+    h_out: jnp.ndarray,   # [B, T, d_B]  — sharded P("data", None, None)
+    kernel: jnp.ndarray,  # [d_B, V]     — sharded P(None, "model")
+    targets: jnp.ndarray, # [B, T]       — sharded P("data", None)
+    mesh,
+    n_model: int,
+    V: int,
+) -> jnp.ndarray:
+    """
+    Cross-entropy loss without materialising the full [B, T, V] logits tensor.
+
+    Each device holds kernel_local [d_B, V/n_model] and computes its shard of
+    the logits locally.  A two-collective distributed softmax then gives the
+    exact same loss as the standard formula:
+        loss = -log(exp(z_target) / sum_v exp(z_v))
+             = log_sum_exp(all z) - z_target
+    """
+    from jax.experimental.shard_map import shard_map as _smap
+    from jax.sharding import PartitionSpec as _P
+
+    V_local = V // n_model
+
+    def body(h_local, k_local, tgt_local):
+        h_shifted   = h_local[:, :-1, :]    # [B_local, T-1, d_B]
+        tgt_shifted = tgt_local[:, 1:]      # [B_local, T-1]
+        B_local, T1, d = h_shifted.shape
+        BT       = B_local * T1
+        h_flat   = h_shifted.reshape(BT, d)
+        tgt_flat = tgt_shifted.reshape(BT)
+
+        local_logits = h_flat @ k_local     # [BT, V_local]
+
+        # Partition function via psum (fully differentiable — no pmax needed).
+        # Clip at ±60 prevents float32 overflow: max psum ≈ n_model*V_local*exp(60)
+        # ≈ 4*8000*1.1e26 ≈ 3.6e30, well inside float32 range (~3.4e38).
+        # In practice logits stay in [-10, 10] so the clip never triggers.
+        exp_s    = jnp.exp(jnp.clip(local_logits, -60.0, 60.0))           # [BT, V_local]
+        global_Z = jax.lax.psum(exp_s.sum(axis=-1), axis_name="model")    # [BT]
+
+        # Gather the target token's logit from the shard that owns it
+        shard_id = jax.lax.axis_index("model")
+        offset   = shard_id * V_local
+        in_shard = (tgt_flat >= offset) & (tgt_flat < offset + V_local)
+        safe_idx = jnp.clip(tgt_flat - offset, 0, V_local - 1)
+        mine     = jnp.where(in_shard, local_logits[jnp.arange(BT), safe_idx], 0.0)
+        true_logit = jax.lax.psum(mine, axis_name="model")                # [BT]
+
+        per_token = jnp.log(global_Z + 1e-8) - true_logit
+        return jax.lax.pmean(per_token.mean(), axis_name="data")
+
+    return _smap(
+        body, mesh=mesh,
+        in_specs=(_P("data", None, None), _P(None, "model"), _P("data", None)),
+        out_specs=_P(),
+        check_rep=False,
+    )(h_out, kernel, targets)
+
+
 class DWAModel(nnx.Module):
     """
     Full DWA forward pass:
@@ -75,7 +133,8 @@ class DWAModel(nnx.Module):
         key_cache: jnp.ndarray | None = None,  # [S, N, d_k] pre-computed keys
         use_pallas: bool = True,          # use Pallas assembly kernel
         mesh=None,                        # jax.sharding.Mesh for shard_map Pallas
-    ) -> tuple[jnp.ndarray, dict]:
+        compute_logits: bool = True,      # False when vocab_parallel handles the lm head
+    ) -> tuple[jnp.ndarray | None, dict]:
         """
         Returns:
             logits:  [B, seq_len, vocab_size]
@@ -154,8 +213,8 @@ class DWAModel(nnx.Module):
             h_mid = self.assembler.layer_norm(h_mid_no_ln)
 
         # Part B
-        h_out = self.part_b(h_mid, cos, sin, mesh)          # [B, T, d_B]
-        logits = self.lm_head(h_out)        # [B, T, vocab_size]
+        h_out = self.part_b(h_mid, cos, sin, mesh)                    # [B, T, d_B]
+        logits = self.lm_head(h_out) if compute_logits else None      # [B, T, vocab_size]
 
         # aux_losses indexes pool_keys with global indices; ensure it is fully
         # replicated so the gather works regardless of model sharding.
@@ -173,6 +232,7 @@ class DWAModel(nnx.Module):
             "W": W,
             "pool_keys": pool_keys_full,
             "W_base": W_base,
+            "h_out": h_out,
         }
         return logits, metrics
 
@@ -199,8 +259,28 @@ def forward_and_loss(
     mesh=None,
 ) -> tuple[jnp.ndarray, dict]:
     """Combined forward + loss for use with nnx.value_and_grad."""
-    logits, metrics = model(input_ids, lambda_val, is_warmup, key_cache, use_pallas, mesh)
-    l_task = task_loss(logits, input_ids)
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    n_model = mesh.shape.get("model", 1) if mesh is not None else 1
+    use_vp  = model.cfg.vocab_parallel and n_model > 1
+
+    logits, metrics = model(
+        input_ids, lambda_val, is_warmup, key_cache, use_pallas, mesh,
+        compute_logits=not use_vp,
+    )
+
+    if use_vp:
+        # Shard lm_head kernel across model axis so each device holds [d_B, V/n_model].
+        # Avoids materialising the full [B, T, V] logits tensor (saves ~4-8 GB/device).
+        kernel = jax.lax.with_sharding_constraint(
+            model.lm_head.kernel[...],
+            NamedSharding(mesh, P(None, "model")),
+        )
+        l_task = _vocab_parallel_cross_entropy(
+            metrics["h_out"], kernel, input_ids, mesh, n_model, model.cfg.vocab_size
+        )
+    else:
+        l_task = task_loss(logits, input_ids)
 
     if aux_on:
         aux = aux_losses(

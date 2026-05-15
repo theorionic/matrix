@@ -70,7 +70,8 @@ def task_loss(logits: jnp.ndarray, targets: jnp.ndarray) -> jnp.ndarray:
     logits_shifted = logits[:, :-1, :]   # [B, T-1, V]
     targets_shifted = targets[:, 1:]     # [B, T-1]
     B, T, V = logits_shifted.shape
-    log_probs = jax.nn.log_softmax(logits_shifted.reshape(B * T, V), axis=-1)
-    one_hot = jax.nn.one_hot(targets_shifted.reshape(B * T), V)
-    loss = -(log_probs * one_hot).sum(axis=-1)
+    flat_logits  = logits_shifted.reshape(B * T, V)
+    flat_targets = targets_shifted.reshape(B * T)
+    log_probs = jax.nn.log_softmax(flat_logits, axis=-1)
+    loss = -log_probs[jnp.arange(B * T), flat_targets]  # gather, no [B*T, V] one_hot
     return loss.mean()

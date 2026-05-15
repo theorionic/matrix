@@ -48,6 +48,7 @@ class DWAConfig:
     compute_dtype: Any = None  # None=float32; set to jnp.bfloat16 for ~4× MXU throughput
     remat: bool = False        # gradient checkpointing: recompute activations, cut ~4× activation memory
     use_flash_attn: bool = False  # Pallas flash attention (hits VMEM limit inside scan+vjp; inference-only)
+    vocab_parallel: bool = True   # shard lm_head across model axis — avoids materialising full [B,T,V] logits
 
     def __post_init__(self):
         needed = self.d_B * self.r + self.r * self.d_A + self.d_B

@@ -607,14 +607,17 @@ def main() -> None:
         tcfg.gate_on_steps = 1500
         tcfg.batch_size    = 64
     elif args.wide:
-        # d=512 uses ~2× more activation memory than d=256.
-        # With --remat batch=64 fits; without it keep batch=32 to be safe.
+        # vocab_parallel shards lm_head over model axis (V/4 per device).
+        # Logits freed: 4 GB → 1 GB.  Attn [B_local,8,2048,2048] is the binding
+        # constraint at seq=2048; remat halves the cost.
         tcfg.batch_size        = 64 if args.remat else 32
-        tcfg.steps_per_window  = 128  # many steps/window → minimal pool projection overhead
+        tcfg.steps_per_window  = 128
     elif args.full:
         # 4-way model parallel × 2-way data parallel on 8 devices.
-        # Batch 64 → 32 per data replica; keeps logits [32,512,32000] at 2 GB.
-        tcfg.batch_size       = 64
+        # vocab_parallel frees ~3 GB of logit memory (4 GB → 1 GB at B_local=16).
+        # Attn [16,4,2048,2048]×12 = 6 GB remains the binding constraint;
+        # batch=32 (16/device) fits comfortably with that freed headroom.
+        tcfg.batch_size       = 32
         tcfg.steps_per_window = 128
     elif args.large:
         tcfg.total_steps   = tcfg.total_steps // 5
