@@ -31,9 +31,10 @@ class MultiAspectRetrieval(nnx.Module):
     def __call__(
         self,
         z: jnp.ndarray,           # [B, d_A]
-        pool_keys: jnp.ndarray,   # [S, N, d_k]
+        pool_keys: jnp.ndarray,   # [S, N, d_k] (may be model-axis-sharded on N)
         lambda_val: float,        # sharpness (Python scalar or 0-d array)
         is_warmup: bool,          # static: True → fixed top-k softmax
+        mesh=None,                # jax.sharding.Mesh; enables all-gather for model parallelism
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """
         Returns:
@@ -46,17 +47,25 @@ class MultiAspectRetrieval(nnx.Module):
         # W_Q: [S, d_k, d_A], z: [B, d_A] → queries: [B, S, d_k]
         queries = jnp.einsum("ska,ba->bsk", self.W_Q[...], z)
 
-        # Step 2 — multi-aspect cosine similarity → [B, S, N]
-        # pool_keys: [S, N, d_k], queries: [B, S, d_k]
+        # Step 2 — multi-aspect cosine similarity → [B, S, N_local]
+        # pool_keys may be model-sharded on N; sim is [B, S, N_local] per device
         sim = jnp.einsum(
             "bsk,snk->bsn",
             queries / (jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-8),
             pool_keys / (jnp.linalg.norm(pool_keys, axis=-1, keepdims=True) + 1e-8),
-        )  # [B, S, N]
+        )  # [B, S, N_local]
 
         # Step 3 — combine aspects with learned weights
         w = jax.nn.softmax(self.aspect_weights[...], axis=0)   # [S]
-        s_i = jnp.einsum("s,bsn->bn", w, sim)                 # [B, N]
+        s_i = jnp.einsum("s,bsn->bn", w, sim)                 # [B, N_local]
+
+        # Step 3b — if pool is model-sharded, all-gather N across model axis
+        # so top-k operates on the full [B, N] global similarity scores
+        if mesh is not None and "model" in mesh.axis_names and mesh.shape["model"] > 1:
+            from jax.sharding import NamedSharding, PartitionSpec as P
+            s_i = jax.lax.with_sharding_constraint(
+                s_i, NamedSharding(mesh, P("data", None))
+            )  # all-gathers N_local → N on the model axis; [B, N_global]
 
         # Step 4a — warmup: fixed top-k with softmax (no sigmoid gate)
         def warmup_select(_):

@@ -17,13 +17,17 @@ class VectorPool(nnx.Module):
     stays coupled to the parameters that store the matrix factors.
     """
 
-    def __init__(self, cfg: DWAConfig, rngs: nnx.Rngs) -> None:
+    def __init__(self, cfg: DWAConfig, rngs: nnx.Rngs, pool_vectors=None) -> None:
         self.cfg = cfg
         pool_dtype = jnp.bfloat16 if cfg.bf16_pool else jnp.float32
-        # Pool vectors: [N, D] — initialized small so early training is stable
-        self.vectors = nnx.Param(
-            (jax.random.normal(rngs.params(), (cfg.N, cfg.D)) * 0.02).astype(pool_dtype)
-        )
+        # Pool vectors: [N, D] — if pre-initialized (e.g. sharded), use that;
+        # otherwise initialize randomly (safe only when N×D fits on one device).
+        if pool_vectors is not None:
+            self.vectors = nnx.Param(pool_vectors)
+        else:
+            self.vectors = nnx.Param(
+                (jax.random.normal(rngs.params(), (cfg.N, cfg.D)) * 0.02).astype(pool_dtype)
+            )
         # Key projections per aspect: [S, D, d_k]
         self.key_proj = nnx.Param(
             (jax.random.normal(rngs.params(), (cfg.S, cfg.D, cfg.d_k))

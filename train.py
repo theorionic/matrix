@@ -16,6 +16,8 @@ Run:
 
 from __future__ import annotations
 
+import numpy as np
+
 # Patch JAX config BEFORE any other import (fixes optax/JAX version mismatch)
 import jax._src.config as _jax_cfg
 
@@ -84,6 +86,83 @@ def _build_optimizer(model: DWAModel, tcfg: TrainConfig) -> nnx.Optimizer:
         optax.masked(optax.adam(tcfg.lr_parts), _make_mask("parts")),
     )
     return nnx.Optimizer(model, tx, wrt=nnx.Param)
+
+
+# ---------------------------------------------------------------------------
+# Multi-device mesh helpers
+# ---------------------------------------------------------------------------
+
+def _select_n_model(cfg: DWAConfig, n_devices: int) -> int:
+    """
+    Choose model-parallel sharding degree so pool+Adam fits in ~8 GB/device.
+
+    TPU v5e has 16 GB HBM; we target 8 GB for pool+Adam, leaving the rest
+    for activations and other params.  n_model must divide n_devices evenly.
+    """
+    pool_and_adam_bytes = cfg.N * cfg.D * 4 * 3  # float32 params + m + v
+    # Conservative: each backward step also allocates up to 2 pool-sized gradient
+    # buffers ([N_local, D] each — one from key_cache, one from gather).  Keep
+    # pool+Adam below 4 GB/device so backward temporaries still fit in 16 GB.
+    target_bytes = 4 * 1024 ** 3  # 4 GB threshold (conservative)
+    for n_model in [1, 2, 4, 8]:
+        if n_model > n_devices:
+            break
+        if n_devices % n_model != 0:
+            continue
+        if pool_and_adam_bytes / n_model <= target_bytes:
+            return n_model
+    return n_devices  # shard across all devices as last resort
+
+
+def _build_mesh(devices, n_model: int) -> "Mesh":
+    """
+    2D Mesh with axes ('data', 'model').
+
+    n_data = n_devices // n_model devices replicate the batch;
+    n_model devices share the pool parameter matrix.
+    """
+    n_devices = len(devices)
+    n_data = n_devices // n_model
+    devices_2d = np.array(devices).reshape(n_data, n_model)
+    return Mesh(devices_2d, ("data", "model"))
+
+
+def _make_sharded_pool_vectors(cfg: "DWAConfig", mesh: "Mesh", rng) -> "jnp.ndarray | None":
+    """
+    Create pool vectors directly on each device's HBM in sharded form.
+
+    Returns a globally-sharded [N, D] JAX array with P('model', None) sharding,
+    or None if n_model == 1 (no model parallelism needed).
+
+    Each device generates only its local [N_local, D] shard — no device ever
+    allocates the full pool, avoiding the OOM that would occur if we initialized
+    everything on device 0 and tried to shard afterwards.
+    """
+    n_model = mesh.shape.get("model", 1)
+    if n_model <= 1:
+        return None
+
+    N_local = cfg.N // n_model
+    pool_dtype = jnp.bfloat16 if cfg.bf16_pool else jnp.float32
+    pool_sharding = NamedSharding(mesh, P("model", None))
+    global_shape = (cfg.N, cfg.D)
+
+    per_device_arrays = []
+    idx_map = pool_sharding.addressable_devices_indices_map(global_shape)
+    for device in pool_sharding.addressable_devices:
+        idx_tuple = idx_map[device]
+        row_start = idx_tuple[0].start or 0
+        m_idx = row_start // N_local          # which model shard this device owns
+        # Compute the shard directly on the target device — no cross-device traffic
+        with jax.default_device(device):
+            rng_dev = jax.device_put(rng, device)
+            key = jax.random.fold_in(rng_dev, m_idx)
+            shard = (jax.random.normal(key, (N_local, cfg.D)) * 0.02).astype(pool_dtype)
+        per_device_arrays.append(shard)
+
+    return jax.make_array_from_single_device_arrays(
+        global_shape, pool_sharding, per_device_arrays
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -315,24 +394,34 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False) -> None:
     devices = jax.devices()
     n_devices = len(devices)
     device_kind = devices[0].device_kind
+
+    # --- Mesh selection ---
+    # Use a 2D ('data', 'model') mesh.  n_model shards the pool to keep
+    # pool+Adam within ~8 GB/device on 16 GB v5e chips.
+    n_model = _select_n_model(cfg, n_devices)
+    n_data = n_devices // n_model
+    mesh = _build_mesh(devices, n_model)
+
     print(f"[DWA] Training on {n_devices}× {device_kind}")
+    print(f"[DWA] Mesh: {n_data}×data  {n_model}×model  "
+          f"(pool+Adam/device ≈ {cfg.N * cfg.D * 4 * 3 / n_model / 1e9:.1f} GB)")
     print(f"[DWA] Model config: N={cfg.N}, D={cfg.D}, d_A={cfg.d_A}, r={cfg.r}, "
           f"layers={cfg.n_layers_A}+{cfg.n_layers_B}, vocab={cfg.vocab_size}")
 
-    # Mesh for data-parallel sharding (batch split across all devices)
-    mesh = Mesh(devices, ("batch",))
-    batch_sharding = NamedSharding(mesh, P("batch"))
-
-    # Per-device batch size
-    assert tcfg.batch_size % n_devices == 0, "batch_size must be divisible by n_devices"
-    local_batch = tcfg.batch_size // n_devices
+    # Per data-replica batch size
+    assert tcfg.batch_size % n_data == 0, "batch_size must be divisible by n_data"
+    local_batch = tcfg.batch_size // n_data
 
     scheduler = PhaseScheduler(tcfg)
     lambda_array = scheduler.make_lambda_array()     # [total_steps]
 
-    # Initialise model
+    # Initialise model.  For configs needing model parallelism (n_model > 1),
+    # create the pool directly on each device's HBM before building the model
+    # — this avoids materialising the full ~4 GB pool on device 0 first.
+    # The optimizer is built after so Adam states inherit the pool's sharding.
     rng = jax.random.PRNGKey(tcfg.seed)
-    model = DWAModel(cfg, nnx.Rngs(rng))
+    sharded_pool = _make_sharded_pool_vectors(cfg, mesh, rng)  # None if n_model==1
+    model = DWAModel(cfg, nnx.Rngs(rng), pool_vectors=sharded_pool)
     optimizer = _build_optimizer(model, tcfg)
     pool_ema = jnp.zeros(cfg.N)
 
@@ -361,7 +450,7 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False) -> None:
             compiled_fns[key] = _make_train_window(
                 tcfg, is_warmup, aux_on,
                 use_pallas=_use_pallas,
-                mesh=mesh if _use_pallas else None,
+                mesh=mesh,  # always pass mesh — needed for model-parallel sharding
             )
         return compiled_fns[key]
 
@@ -400,9 +489,8 @@ def train(cfg: DWAConfig, tcfg: TrainConfig, use_pattern: bool = False) -> None:
                 cfg.seq_len, cfg.vocab_size,
             )
 
-        # Shard data: batch dim across devices
-        # data_window: [steps, B, seq_len] — shard along batch axis (dim 1)
-        data_sharded = jax.device_put(data_window, NamedSharding(mesh, P(None, "batch", None)))
+        # Shard data: batch dim across data-parallel replicas (dim 1)
+        data_sharded = jax.device_put(data_window, NamedSharding(mesh, P(None, "data", None)))
 
         train_fn = get_train_fn(is_warmup, aux_on)
         t_win = time.time()
@@ -502,7 +590,9 @@ def main() -> None:
         tcfg.gate_on_steps = 1500
         tcfg.batch_size    = 64
     elif args.full:
-        pass
+        # 4-way model parallel × 2-way data parallel on 8 devices.
+        # Batch 64 → 32 per data replica; keeps logits [32,512,32000] at 2 GB.
+        tcfg.batch_size = 64
     elif args.large:
         tcfg.total_steps   = tcfg.total_steps // 5
         tcfg.warmup_steps  = tcfg.warmup_steps // 5

@@ -13,6 +13,37 @@ from .pool import VectorPool
 from .retrieval import MultiAspectRetrieval
 
 
+def _distributed_gather(pool_vecs, indices, mesh):
+    """
+    Gather pool vectors from a model-axis-sharded pool.
+
+    Each device owns pool_vecs[N_local, D] (sharded on the 'model' axis).
+    Each device knows only its own shard; indices are global [B_local, k_max].
+
+    Implementation: each device gathers from its local shard, masks out
+    entries that don't belong to it, then psum across the model axis
+    to combine — only one shard contributes non-zero for each index.
+    """
+    from jax.experimental.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+
+    def _fn(local_pool, local_idx):
+        N_local = local_pool.shape[0]
+        my_shard = jax.lax.axis_index("model")
+        local_gathered = local_pool[local_idx % N_local]          # [B, k, D]
+        belongs = (local_idx // N_local == my_shard)[:, :, None]  # [B, k, 1]
+        masked = jnp.where(belongs, local_gathered, jnp.zeros_like(local_gathered))
+        return jax.lax.psum(masked, axis_name="model")            # [B, k, D]
+
+    return shard_map(
+        _fn,
+        mesh=mesh,
+        in_specs=(P("model", None), P("data", None)),
+        out_specs=P("data", None, None),
+        check_rep=False,
+    )(pool_vecs, indices)
+
+
 class DWAModel(nnx.Module):
     """
     Full DWA forward pass:
@@ -21,13 +52,14 @@ class DWAModel(nnx.Module):
     The pool EMA (non-trainable) tracks per-vector utilization for L_util.
     """
 
-    def __init__(self, cfg: DWAConfig, rngs: nnx.Rngs) -> None:
+    def __init__(self, cfg: DWAConfig, rngs: nnx.Rngs, pool_vectors=None) -> None:
         self.cfg = cfg
         # Token embedding + positional (sinusoidal, fixed)
         self.embed = nnx.Embed(cfg.vocab_size, cfg.d_A, rngs=rngs)
         self.part_a = PartA(cfg, rngs)
         self.part_b = PartB(cfg, rngs)
-        self.pool = VectorPool(cfg, rngs)
+        # pool_vectors: pre-sharded [N, D] array; if None, VectorPool generates randomly
+        self.pool = VectorPool(cfg, rngs, pool_vectors=pool_vectors)
         self.retrieval = MultiAspectRetrieval(cfg, rngs)
         self.assembler = WeightAssembler(cfg, rngs)
         self.lm_head = nnx.Linear(cfg.d_B, cfg.vocab_size, use_bias=False, rngs=rngs)
@@ -70,11 +102,21 @@ class DWAModel(nnx.Module):
         else:
             pool_keys = key_cache                  # [S, N, d_k] — free
 
-        # Retrieval
-        alphas, indices = self.retrieval(z, pool_keys, lambda_val, is_warmup)
+        # Retrieval — mesh enables model-axis all-gather inside retrieval
+        alphas, indices = self.retrieval(z, pool_keys, lambda_val, is_warmup, mesh=mesh)
 
-        # Gather pool vectors: [B, k_max, D]; cast to float32 if pool is bfloat16
-        gathered = self.pool.vectors[...][indices]
+        # Gather pool vectors [B, k_max, D]; uses distributed gather when pool is
+        # model-sharded so we never all-gather the full 4 GB pool across devices.
+        pool_vecs = self.pool.vectors[...]
+        use_dist = (
+            mesh is not None
+            and "model" in mesh.axis_names
+            and mesh.shape["model"] > 1
+        )
+        if use_dist:
+            gathered = _distributed_gather(pool_vecs, indices, mesh)
+        else:
+            gathered = pool_vecs[indices]
         if gathered.dtype != jnp.float32:
             gathered = gathered.astype(jnp.float32)
 
@@ -106,11 +148,21 @@ class DWAModel(nnx.Module):
         h_out = self.part_b(h_mid)          # [B, T, d_B]
         logits = self.lm_head(h_out)        # [B, T, vocab_size]
 
+        # aux_losses indexes pool_keys with global indices; ensure it is fully
+        # replicated so the gather works regardless of model sharding.
+        if use_dist:
+            from jax.sharding import NamedSharding, PartitionSpec as P
+            pool_keys_full = jax.lax.with_sharding_constraint(
+                pool_keys, NamedSharding(mesh, P(None, None, None))
+            )  # all-gathers N_local → N on model axis; [S, N, d_k] = ~65 MB
+        else:
+            pool_keys_full = pool_keys
+
         metrics = {
             "alphas": alphas,
             "indices": indices,
             "W": W,
-            "pool_keys": pool_keys,
+            "pool_keys": pool_keys_full,
             "W_base": W_base,
         }
         return logits, metrics
