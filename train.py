@@ -837,10 +837,11 @@ def save_checkpoint(
     mngr.save(steps_done, args=ocp.args.StandardSave(save_item))
     mngr.wait_until_finished()
 
-    # Save packed token buffer alongside the orbax step directory
-    if loader is not None and loader._buf_pos < len(loader._buf):
-        buf_path = os.path.join(ckpt_dir, str(steps_done), "buf.npy")
-        np.save(buf_path, loader._buf[loader._buf_pos :])
+    # Save loader state (cursor + remaining buffer) as a single npz
+    if loader is not None:
+        state = loader.state_dict()
+        loader_path = os.path.join(ckpt_dir, str(steps_done), "loader_state.npz")
+        np.savez(loader_path, cursor=np.array(state["cursor"], dtype=np.int32), buf=state["buf"])
 
     print(f"[Ckpt] Saved step {steps_done} → {ckpt_dir}/{steps_done}/")
 
@@ -928,10 +929,16 @@ def load_checkpoint(
     steps_done  = int(restored["meta"]["steps_done"])
 
     # --- Loader state (cursor + packed buf) ---
-    row_cursor = int(restored["meta"]["row_cursor"])
-    buf_path   = os.path.join(ckpt_dir, str(steps_done_target), "buf.npy")
-    buf        = np.load(buf_path) if os.path.exists(buf_path) else np.empty((0,), dtype=np.int32)
-    loader_state = {"cursor": row_cursor, "buf": buf}
+    loader_path = os.path.join(ckpt_dir, str(steps_done_target), "loader_state.npz")
+    if os.path.exists(loader_path):
+        d = np.load(loader_path)
+        loader_state = {"cursor": int(d["cursor"]), "buf": d["buf"]}
+    else:
+        # Legacy fallback: cursor in orbax meta, buf in separate buf.npy
+        row_cursor = int(restored["meta"]["row_cursor"])
+        buf_path   = os.path.join(ckpt_dir, str(steps_done_target), "buf.npy")
+        buf        = np.load(buf_path) if os.path.exists(buf_path) else np.empty((0,), dtype=np.int32)
+        loader_state = {"cursor": row_cursor, "buf": buf}
 
     print(f"[Ckpt] Loaded step {steps_done} from {ckpt_dir}/{steps_done_target}/")
     return steps_done, rng, loader_state, pool_ema
