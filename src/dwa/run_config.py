@@ -50,6 +50,8 @@ class DataConfig:
     hf_path: str = "roneneldan/TinyStories"   # HuggingFace dataset path (tiny_stories mode)
     hf_text_column: str = "text"              # column containing raw text
     gen_every: int = 100         # generate text sample every N steps (tiny_stories only)
+    val_every: int = 500         # compute validation loss every N steps (0 = disabled)
+    val_batches: int = 32        # number of batches used for each val loss estimate
 
 
 @dataclass

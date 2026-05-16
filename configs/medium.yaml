@@ -58,6 +58,8 @@ data:
   hf_path: roneneldan/TinyStories
   hf_text_column: text
   gen_every: 500
+  val_every: 500
+  val_batches: 32
 checkpoint:
   dir: ''
   every: 1000

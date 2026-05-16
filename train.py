@@ -37,6 +37,7 @@ import argparse
 import functools
 import os
 import time
+import threading
 from collections import deque
 from typing import NamedTuple
 
@@ -50,6 +51,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from src.dwa.assembly_pallas import compute_key_cache
 from src.dwa.config import DWAConfig, TrainConfig
+from src.dwa.losses import task_loss
 from src.dwa.model import DWAModel, forward_and_loss
 from src.dwa.run_config import (
     CheckpointConfig, DataConfig, RunConfig, ShardingConfig,
@@ -341,15 +343,19 @@ def _synthetic_window(
 
 class TinyStoriesLoader:
     """
-    Bulk HuggingFace dataset loader.
+    Bulk HuggingFace dataset loader with background prefetching.
 
-    Loads the full dataset once (Arrow-cached on disk after first download),
-    then fetches FETCH_SIZE rows at a time via ds.select() — a zero-copy Arrow
-    slice — and batch-tokenizes them in a single tokenizer() call.
-    Tokens are flattened and packed into a [N, seq_len] int32 array.
-    get_window() slices from this packed buffer, refilling when low.
+    Fetches FETCH_SIZE rows via ds.select() and batch-tokenizes them in a
+    background thread while training runs.  By the time the current buffer
+    drains (~8s at medium config), the next chunk is already ready — so
+    get_window() never blocks on tokenization after the first fill.
 
-    No per-row Python loop during training; ~4-5s per refill of 50k rows.
+    Timeline:
+        t=0s  first fill completes (blocking), prefetch thread starts
+        t=0s  training begins, consuming ~4k seqs/window at 0.8s/window
+        t=4s  prefetch thread finishes tokenizing next 50k rows
+        t=8s  buffer exhausted → _refill() swaps in the pre-built buffer (instant)
+                                  and starts the next background prefetch
     """
 
     FETCH_SIZE = 50_000  # rows per bulk fetch
@@ -364,46 +370,83 @@ class TinyStoriesLoader:
         self.text_column = text_column
         self.eos         = tokenizer.eos_token_id or 0
 
-        self.ds      = load_dataset(hf_path, split="train")
-        self.n_rows  = len(self.ds)
-        self._cursor  = 0                                        # next row to fetch
-        self._buf     = np.empty((0, seq_len), dtype=np.int32)  # packed seqs [N, seq_len]
-        self._buf_pos = 0                                        # next seq to serve
+        self.ds     = load_dataset(hf_path, split="train")
+        self.n_rows = len(self.ds)
+        self._cursor  = 0
+        self._buf     = np.empty((0, seq_len), dtype=np.int32)
+        self._buf_pos = 0
+
+        # Prefetch state — written by worker thread, read by main thread
+        self._pf_buf:    np.ndarray | None = None
+        self._pf_cursor: int               = 0
+        self._pf_event   = threading.Event()
+
         print(f"[DWA] HF loader: {hf_path!r}  rows={self.n_rows:,}  "
               f"col={text_column!r}  seq_len={seq_len}  fetch={self.FETCH_SIZE:,}")
 
-    def _refill(self) -> None:
-        end   = min(self._cursor + self.FETCH_SIZE, self.n_rows)
-        texts = list(self.ds.select(range(self._cursor, end))[self.text_column])
-        self._cursor = end % self.n_rows   # wrap at dataset end
+        # First blocking fill so training can start immediately
+        packed, self._cursor = self._fetch_and_pack(self._cursor)
+        self._buf = packed
+        print(f"[DWA] Loader ready: {len(self._buf)} seqs  cursor={self._cursor:,}/{self.n_rows:,}")
 
-        # Batch tokenize all rows in one call — no per-row loop
+        # Kick off prefetch for the second chunk right away
+        self._start_prefetch()
+
+    def _fetch_and_pack(self, cursor: int):
+        """Fetch FETCH_SIZE rows; return (packed [N, seq_len], new_cursor)."""
+        end   = min(cursor + self.FETCH_SIZE, self.n_rows)
+        texts = list(self.ds.select(range(cursor, end))[self.text_column])
+        new_cursor = end % self.n_rows
+
         ids_list = self.tokenizer(
             texts, add_special_tokens=False,
             return_attention_mask=False, return_token_type_ids=False,
         )["input_ids"]
 
-        # Flatten into 1D int32 with eos separator, then pack into [N, seq_len]
-        total = sum(len(s) + 1 for s in ids_list)
+        # Wrap each story: <|endoftext|> story tokens <|endoftext|>
+        # The leading token marks the start of a new document; the trailing
+        # token marks its end.  Both use the same ID in GPT-2 (50256).
+        total = sum(len(s) + 2 for s in ids_list)  # +2: BOS + EOS per story
         flat  = np.empty(total, dtype=np.int32)
         pos   = 0
-        for ids in ids_list:                    # 50k iterations max, numpy slice assign
+        for ids in ids_list:
             n = len(ids)
-            flat[pos : pos + n] = ids
-            flat[pos + n]       = self.eos
-            pos += n + 1
+            flat[pos]               = self.eos        # BOS  <|endoftext|>
+            flat[pos + 1 : pos + 1 + n] = ids        # story tokens
+            flat[pos + 1 + n]       = self.eos        # EOS  <|endoftext|>
+            pos += n + 2
 
-        n_new    = pos // self.seq_len
-        new_seqs = flat[: n_new * self.seq_len].reshape(n_new, self.seq_len)
+        n_seqs = pos // self.seq_len
+        return flat[: n_seqs * self.seq_len].reshape(n_seqs, self.seq_len), new_cursor
+
+    def _start_prefetch(self) -> None:
+        """Launch a daemon thread to prepare the next chunk in the background."""
+        cursor = self._cursor
+        self._pf_event.clear()
+
+        def _worker():
+            packed, new_cursor = self._fetch_and_pack(cursor)
+            self._pf_buf    = packed
+            self._pf_cursor = new_cursor
+            self._pf_event.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _refill(self) -> None:
+        """Swap in the prefetched buffer (blocks only if prefetch isn't done yet)."""
+        self._pf_event.wait()          # almost always instant — prefetch took ~4s, training ~8s
 
         leftover      = self._buf[self._buf_pos :]
-        self._buf     = np.concatenate([leftover, new_seqs], axis=0)
+        new_seqs      = self._pf_buf
+        self._cursor  = self._pf_cursor
+        self._buf     = np.concatenate([leftover, new_seqs], axis=0) if len(leftover) else new_seqs
         self._buf_pos = 0
-        print(f"[DWA] Loader refilled: fetched {len(texts)} rows → +{n_new} seqs  "
-              f"buf={len(self._buf)}  cursor={self._cursor:,}/{self.n_rows:,}")
+        print(f"[DWA] Loader: buf={len(self._buf)} seqs  cursor={self._cursor:,}/{self.n_rows:,}")
+
+        # Start the next prefetch immediately while training continues
+        self._start_prefetch()
 
     def get_window(self, steps: int, batch_size: int) -> np.ndarray:
-        """Return int32 array [steps, batch_size, seq_len] of real token IDs."""
         needed = steps * batch_size
         while len(self._buf) - self._buf_pos < needed:
             self._refill()
@@ -415,19 +458,91 @@ class TinyStoriesLoader:
         return {"cursor": self._cursor, "buf": self._buf[self._buf_pos :]}
 
     def load_state_dict(self, state: dict) -> None:
+        # Wait for any in-flight prefetch to finish before overwriting state
+        self._pf_event.wait()
         self._cursor = int(state["cursor"])
-        buf_data     = state.get("buf")
+        buf_data = state.get("buf")
         if buf_data is not None and len(buf_data):
             arr = np.asarray(buf_data, dtype=np.int32)
-            if arr.ndim == 2:                           # already packed [N, seq_len]
+            if arr.ndim == 2:
                 self._buf = arr
-            else:                                       # flat 1D (legacy / npy load)
-                n         = len(arr) // self.seq_len
+            else:
+                n = len(arr) // self.seq_len
                 self._buf = arr[: n * self.seq_len].reshape(n, self.seq_len)
         else:
             self._buf = np.empty((0, self.seq_len), dtype=np.int32)
         self._buf_pos = 0
         print(f"[DWA] Loader restored at row {self._cursor:,} ({len(self._buf)} seqs buffered)")
+        self._start_prefetch()
+
+
+# ---------------------------------------------------------------------------
+# Validation cache — fixed validation set preloaded once at startup
+# ---------------------------------------------------------------------------
+
+class _ValCache:
+    """
+    Preloads the HuggingFace 'validation' split once and caches a fixed
+    numpy array of shape [val_batches, batch_size, seq_len] for repeated use.
+    Because the array is fixed, every val evaluation measures the exact same
+    distribution — making train vs val curves directly comparable over time.
+    """
+
+    def __init__(self, tokenizer, seq_len: int, hf_path: str, text_column: str,
+                 val_batches: int, batch_size: int):
+        from datasets import load_dataset
+        ds   = load_dataset(hf_path, split="validation")
+        eos  = tokenizer.eos_token_id or 0
+        texts = list(ds[text_column])
+
+        ids_list = tokenizer(
+            texts, add_special_tokens=False,
+            return_attention_mask=False, return_token_type_ids=False,
+        )["input_ids"]
+
+        total = sum(len(s) + 2 for s in ids_list)  # +2: BOS + EOS per story
+        flat  = np.empty(total, dtype=np.int32)
+        pos   = 0
+        for ids in ids_list:
+            n = len(ids)
+            flat[pos]               = eos              # BOS  <|endoftext|>
+            flat[pos + 1 : pos + 1 + n] = ids
+            flat[pos + 1 + n]       = eos              # EOS  <|endoftext|>
+            pos += n + 2
+
+        needed = val_batches * batch_size
+        assert pos // seq_len >= needed, (
+            f"Val split too small: only {pos // seq_len} seqs but need {needed}"
+        )
+        self.data = flat[: needed * seq_len].reshape(val_batches, batch_size, seq_len)
+        self.val_batches = val_batches
+        self.batch_size  = batch_size
+        self.seq_len     = seq_len
+        print(f"[DWA] Val cache: {val_batches}×{batch_size}×{seq_len}  "
+              f"({needed} seqs from {len(texts)} val stories)")
+
+
+@nnx.jit
+def _val_step_jit(model: "DWAModel", batch: jnp.ndarray, lam: float) -> jnp.ndarray:
+    """Single forward pass for validation — no gradients, no aux losses."""
+    logits, _ = model(batch, lam, is_warmup=False, use_pallas=False)
+    return task_loss(logits, batch)
+
+
+def _compute_val_loss(
+    model: "DWAModel",
+    val_cache: _ValCache,
+    lam: float,
+    mesh,
+) -> float:
+    """Average task loss over all cached validation batches."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    total = 0.0
+    for i in range(val_cache.val_batches):
+        batch = jnp.array(val_cache.data[i])                         # [B, seq_len]
+        batch = jax.device_put(batch, NamedSharding(mesh, P("data", None)))
+        total += float(_val_step_jit(model, batch, lam))
+    return total / val_cache.val_batches
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +1105,18 @@ def train(run_cfg: RunConfig) -> None:
                                 text_column=run_cfg.data.hf_text_column)
               if tokenizer is not None else None)
 
+    # Validation cache — preloaded once, fixed for the entire run
+    val_every  = run_cfg.data.val_every
+    val_cache: "_ValCache | None" = None
+    if tokenizer is not None and val_every > 0:
+        val_cache = _ValCache(
+            tokenizer, cfg.seq_len,
+            hf_path=run_cfg.data.hf_path,
+            text_column=run_cfg.data.hf_text_column,
+            val_batches=run_cfg.data.val_batches,
+            batch_size=tcfg.batch_size,
+        )
+
     # Pallas + shard_map is verified correct but hits a TPU VMEM constraint
     # when compiled inside jax.lax.scan + value_and_grad (the scan backward
     # JVP context has a 16MB scoped VMEM limit that the kernel exceeds).
@@ -1049,6 +1176,9 @@ def train(run_cfg: RunConfig) -> None:
     _consecutive_nan = 0
     _loss_window: deque = deque(maxlen=50)   # rolling buffer for spike detection
 
+    # Last computed validation loss (updated every val_every steps)
+    _last_val_loss: float | None = None
+
     t0 = time.time()
     for window_idx in range(start_window, n_windows):
         start_step = window_idx * tcfg.steps_per_window
@@ -1101,10 +1231,11 @@ def train(run_cfg: RunConfig) -> None:
             _ss_steps += tcfg.steps_per_window
             _ss_time  += win_secs
             _win_min   = min(_win_min, win_secs)
+        val_str = f"  val={_last_val_loss:.4f}" if _last_val_loss is not None else ""
         print(
             f"[DWA] step={steps_done:6d}/{tcfg.total_steps} "
             f"phase={phase:8s} λ={scheduler.get_lambda(start_step):.2f} "
-            f"loss={mean_loss:.4f} "
+            f"loss={mean_loss:.4f}{val_str} "
             f"win={win_secs:.1f}s  steps/s={win_steps_per_sec:.1f}  "
             f"tok/s={win_tok_per_sec:,}  TFLOP/s={achieved_tflops:.1f}"
             + ("  [compile]" if is_compile_win else "")
@@ -1174,6 +1305,14 @@ def train(run_cfg: RunConfig) -> None:
             n_revived = _revive_dead_vectors(model, pool_ema, cfg, tcfg, steps_done)
             if n_revived > 0:
                 print(f"[Safety] Revived {n_revived}/{cfg.N} dead pool vectors.")
+
+        # Validation loss (boundary crossing — fires every val_every steps)
+        if val_cache is not None and val_every > 0 and \
+                (steps_done // val_every) > (prev_steps // val_every):
+            lam_val = float(tcfg.lambda_sharpen_end)
+            _last_val_loss = _compute_val_loss(model, val_cache, lam_val, mesh)
+            print(f"[Val]  step={steps_done:6d}  train={mean_loss:.4f}  val={_last_val_loss:.4f}  "
+                  f"gap={_last_val_loss - mean_loss:+.4f}")
 
         if tokenizer is not None and (steps_done // gen_every) > (prev_steps // gen_every):
             _generate_text_sample(model, tokenizer, tcfg, steps_done)
