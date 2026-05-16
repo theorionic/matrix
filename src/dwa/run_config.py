@@ -46,8 +46,10 @@ class ShardingConfig:
 @dataclass
 class DataConfig:
     """Dataset and generation options."""
-    source: str = "random"  # "random" | "tiny_stories" | "pattern"
-    gen_every: int = 100    # generate text sample every N steps (tiny_stories only)
+    source: str = "random"       # "random" | "tiny_stories" | "pattern"
+    hf_path: str = "roneneldan/TinyStories"   # HuggingFace dataset path (tiny_stories mode)
+    hf_text_column: str = "text"              # column containing raw text
+    gen_every: int = 100         # generate text sample every N steps (tiny_stories only)
 
 
 @dataclass

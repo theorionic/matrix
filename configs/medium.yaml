@@ -1,9 +1,9 @@
 name: medium
 model:
   D: 4096
-  N: 16384
+  N: 1024
   use_ivf: true
-  C: 128
+  C: 32
   m: 8
   d_A: 128
   d_B: 128
@@ -33,7 +33,7 @@ train:
   lambda_gate_start: 1.0
   lambda_gate_end: 5.0
   lambda_sharpen_end: 10.0
-  lambda_util: 0.1
+  lambda_util: 1.0
   lambda_div: 0.01
   lambda_norm: 0.001
   lambda_sparse: 0.001
@@ -54,8 +54,10 @@ train:
 sharding:
   n_model: auto
 data:
-  source: random
-  gen_every: 100
+  source: tiny_stories
+  hf_path: roneneldan/TinyStories
+  hf_text_column: text
+  gen_every: 500
 checkpoint:
   dir: ''
   every: 1000

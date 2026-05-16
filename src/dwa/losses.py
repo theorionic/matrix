@@ -21,16 +21,29 @@ def aux_losses(
     (no NNX wrappers) so this is a pure function compatible with jax.grad.
     """
     B, k = alphas.shape
+    N = soft_full.shape[-1]  # full pool size (soft_full always covers all N)
 
-    # L_util: maximise entropy of the full pre-top-k retrieval distribution.
-    # soft_full [B, N_cands] is the differentiable soft distribution returned
-    # by the retrieval module before the discrete top-k selection.  Its entropy
-    # has real gradient through W_Q / key_proj → drives diverse pool coverage.
-    # l_util = max_entropy - H(soft_full), so 0 = uniform, max = collapsed.
-    safe_soft = jnp.clip(soft_full, 1e-8, 1.0)
-    H = -(safe_soft * jnp.log(safe_soft)).sum(axis=-1).mean()
-    max_H = jnp.log(jnp.array(soft_full.shape[-1], dtype=jnp.float32))
-    l_util = max_H - H   # 0 when perfectly uniform, positive when collapsed
+    # L_util: Switch Transformer-style load-balancing loss.
+    #
+    # entropy alone doesn't prevent collapse because it only touches key
+    # projections — assembly factors (U,V,b) get zero gradient for unselected
+    # vectors.  The Switch loss couples the HARD selection frequency (f_i, which
+    # drives the task gradient) with the SOFT probability (P_i, which is
+    # differentiable), so the optimizer is penalised every time the hard
+    # selections concentrate on a small subset.
+    #
+    # f_i  = fraction of (batch × k) selections that chose vector i  [N]
+    # P_i  = mean soft probability assigned to vector i               [N]
+    # l_lb = N × Σ_i f_i × P_i
+    #      → 1.0 when perfectly uniform, → N when fully collapsed to 1 vector
+    #
+    # Gradient w.r.t. soft_full[b,i]: N × f_i / B
+    #   • heavy hitters (high f_i) get penalised → model lowers their P_i
+    #   • via softmax normalisation this raises P_i for dead vectors
+    flat_idx = indices.reshape(-1)                               # [B*k]
+    f = jnp.zeros(N).at[flat_idx].add(1.0) / (B * k)           # [N], sums to 1
+    P = soft_full.mean(axis=0)                                   # [N]
+    l_util = N * jnp.dot(f, P)   # 1.0 = uniform, N = total collapse
 
     # L_div: prevent key collapse among retrieved keys
     # Gather the S-aspect keys for retrieved vectors: [B, k, S, d_k]

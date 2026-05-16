@@ -79,7 +79,7 @@ def _build_optimizer(model: DWAModel, tcfg: TrainConfig) -> nnx.Optimizer:
             return "pool"
         if "tau" in p or "gamma" in p:
             return "threshold"
-        if "W_Q" in p or "aspect_weights" in p or "centroids" in p:
+        if "W_Q" in p or "aspect_weights" in p:
             return "retrieval"
         return "parts"
 
@@ -200,7 +200,7 @@ def compute_step_flops(cfg: DWAConfig, tcfg: TrainConfig) -> int:
 # Training window (compiled with nnx.jit; runs steps_per_window steps on TPU)
 # ---------------------------------------------------------------------------
 
-def _make_train_window(tcfg: TrainConfig, is_warmup: bool, aux_on: bool,
+def _make_train_window(cfg: DWAConfig, tcfg: TrainConfig, is_warmup: bool, aux_on: bool,
                        use_pallas: bool = True, mesh=None):
     """
     Returns a compiled function that runs steps_per_window training steps
@@ -285,6 +285,25 @@ def _make_train_window(tcfg: TrainConfig, is_warmup: bool, aux_on: bool,
         (model, optimizer, pool_ema_out, _), (losses, all_indices, grad_norms, nan_flags) = (
             jax.lax.scan(step_fn, init_carry, (data, lambda_vals))
         )
+
+        # ── EMA centroid update ───────────────────────────────────────────────
+        # Recompute pool keys after optimizer updates pool.vectors, then set
+        # each centroid = EMA(mean of its cluster partition's key vectors).
+        # Centroids are CentroidEMA (not Param) so the optimizer never touches
+        # them — they track actual pool key space, eliminating the routing
+        # feedback loop that causes pool collapse.
+        if cfg.use_ivf:
+            key_cache_new = compute_key_cache(
+                model.pool.vectors[...].astype(jnp.float32),
+                model.pool.key_proj[...].astype(jnp.float32),
+            )  # [S, N, d_k]
+            N_per_C = cfg.N // cfg.C
+            new_c = key_cache_new.reshape(
+                cfg.S, cfg.C, N_per_C, cfg.d_k
+            ).mean(axis=2)  # [S, C, d_k]
+            old_c = model.retrieval.centroids[...]
+            model.retrieval.centroids[...] = 0.9 * old_c + 0.1 * new_c
+
         return model, optimizer, pool_ema_out, {
             "losses":       losses,           # [steps_per_window]
             "last_indices": all_indices[-1],  # [B, k_max] — last step only
@@ -317,74 +336,98 @@ def _synthetic_window(
 
 
 # ---------------------------------------------------------------------------
-# TinyStories real data loader — streaming, chunked iterator
+# HuggingFace text loader — bulk select, batch tokenize, pack into sequences
 # ---------------------------------------------------------------------------
 
 class TinyStoriesLoader:
     """
-    Streams roneneldan/TinyStories, tokenises with GPT-2, and packs tokens
-    into fixed-length windows.  Uses the chunked-iterator pattern:
+    Bulk HuggingFace dataset loader.
 
-        iterator = dataset.iter(batch_size=CHUNK_SIZE)
-        chunk = next(iterator)   # dict {"text": [str, ...]}
+    Loads the full dataset once (Arrow-cached on disk after first download),
+    then fetches FETCH_SIZE rows at a time via ds.select() — a zero-copy Arrow
+    slice — and batch-tokenizes them in a single tokenizer() call.
+    Tokens are flattened and packed into a [N, seq_len] int32 array.
+    get_window() slices from this packed buffer, refilling when low.
 
-    A token buffer accumulates across chunks so we never download more than
-    needed.  get_window() refills automatically when the buffer runs low.
+    No per-row Python loop during training; ~4-5s per refill of 50k rows.
     """
 
-    CHUNK_SIZE = 2000  # stories per HuggingFace fetch
+    FETCH_SIZE = 50_000  # rows per bulk fetch
 
-    def __init__(self, tokenizer, seq_len: int):
+    def __init__(self, tokenizer, seq_len: int,
+                 hf_path: str = "roneneldan/TinyStories",
+                 text_column: str = "text"):
         from datasets import load_dataset
-        self.tokenizer      = tokenizer
-        self.seq_len        = seq_len
-        self._chunks_fetched = 0
-        dataset             = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
-        self._iterator      = dataset.iter(batch_size=self.CHUNK_SIZE)
-        self._buf: list[int] = []
-        print(f"[DWA] TinyStories loader ready (chunk={self.CHUNK_SIZE} stories, seq_len={seq_len})")
+        self.tokenizer   = tokenizer
+        self.seq_len     = seq_len
+        self.hf_path     = hf_path
+        self.text_column = text_column
+        self.eos         = tokenizer.eos_token_id or 0
+
+        self.ds      = load_dataset(hf_path, split="train")
+        self.n_rows  = len(self.ds)
+        self._cursor  = 0                                        # next row to fetch
+        self._buf     = np.empty((0, seq_len), dtype=np.int32)  # packed seqs [N, seq_len]
+        self._buf_pos = 0                                        # next seq to serve
+        print(f"[DWA] HF loader: {hf_path!r}  rows={self.n_rows:,}  "
+              f"col={text_column!r}  seq_len={seq_len}  fetch={self.FETCH_SIZE:,}")
 
     def _refill(self) -> None:
-        chunk = next(self._iterator)          # {"text": ["Once upon a time ...", ...]}
-        self._chunks_fetched += 1
-        eos   = self.tokenizer.eos_token_id
-        for text in chunk["text"]:
-            self._buf.extend(self.tokenizer.encode(text))
-            if eos is not None:
-                self._buf.append(eos)
+        end   = min(self._cursor + self.FETCH_SIZE, self.n_rows)
+        texts = list(self.ds.select(range(self._cursor, end))[self.text_column])
+        self._cursor = end % self.n_rows   # wrap at dataset end
 
-    def state_dict(self) -> dict:
-        """Return serialisable state so the loader can be restored exactly."""
-        return {"chunks_fetched": self._chunks_fetched, "buf": list(self._buf)}
+        # Batch tokenize all rows in one call — no per-row loop
+        ids_list = self.tokenizer(
+            texts, add_special_tokens=False,
+            return_attention_mask=False, return_token_type_ids=False,
+        )["input_ids"]
 
-    def load_state_dict(self, state: dict) -> None:
-        """Fast-forward the HuggingFace iterator to the saved position."""
-        target = int(state["chunks_fetched"])
-        if target > 0:
-            print(f"[DWA] Loader fast-forward: skipping {target} chunks...")
-            for i in range(target):
-                try:
-                    next(self._iterator)      # discard — just advance iterator
-                except StopIteration:
-                    from datasets import load_dataset
-                    dataset = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
-                    self._iterator = dataset.iter(batch_size=self.CHUNK_SIZE)
-                    self._chunks_fetched = 0
-                    break
-                if (i + 1) % 500 == 0:
-                    print(f"[DWA] Loader fast-forward: {i + 1}/{target} chunks...")
-        self._chunks_fetched = target
-        self._buf = list(state["buf"])
-        print(f"[DWA] Loader restored at chunk {target} ({len(self._buf)} tokens buffered).")
+        # Flatten into 1D int32 with eos separator, then pack into [N, seq_len]
+        total = sum(len(s) + 1 for s in ids_list)
+        flat  = np.empty(total, dtype=np.int32)
+        pos   = 0
+        for ids in ids_list:                    # 50k iterations max, numpy slice assign
+            n = len(ids)
+            flat[pos : pos + n] = ids
+            flat[pos + n]       = self.eos
+            pos += n + 1
+
+        n_new    = pos // self.seq_len
+        new_seqs = flat[: n_new * self.seq_len].reshape(n_new, self.seq_len)
+
+        leftover      = self._buf[self._buf_pos :]
+        self._buf     = np.concatenate([leftover, new_seqs], axis=0)
+        self._buf_pos = 0
+        print(f"[DWA] Loader refilled: fetched {len(texts)} rows → +{n_new} seqs  "
+              f"buf={len(self._buf)}  cursor={self._cursor:,}/{self.n_rows:,}")
 
     def get_window(self, steps: int, batch_size: int) -> np.ndarray:
         """Return int32 array [steps, batch_size, seq_len] of real token IDs."""
-        needed = steps * batch_size * self.seq_len
-        while len(self._buf) < needed:
+        needed = steps * batch_size
+        while len(self._buf) - self._buf_pos < needed:
             self._refill()
-        tokens    = np.array(self._buf[:needed], dtype=np.int32)
-        self._buf = self._buf[needed:]
-        return tokens.reshape(steps, batch_size, self.seq_len)
+        out           = self._buf[self._buf_pos : self._buf_pos + needed]
+        self._buf_pos += needed
+        return out.reshape(steps, batch_size, self.seq_len)
+
+    def state_dict(self) -> dict:
+        return {"cursor": self._cursor, "buf": self._buf[self._buf_pos :]}
+
+    def load_state_dict(self, state: dict) -> None:
+        self._cursor = int(state["cursor"])
+        buf_data     = state.get("buf")
+        if buf_data is not None and len(buf_data):
+            arr = np.asarray(buf_data, dtype=np.int32)
+            if arr.ndim == 2:                           # already packed [N, seq_len]
+                self._buf = arr
+            else:                                       # flat 1D (legacy / npy load)
+                n         = len(arr) // self.seq_len
+                self._buf = arr[: n * self.seq_len].reshape(n, self.seq_len)
+        else:
+            self._buf = np.empty((0, self.seq_len), dtype=np.int32)
+        self._buf_pos = 0
+        print(f"[DWA] Loader restored at row {self._cursor:,} ({len(self._buf)} seqs buffered)")
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +459,55 @@ def _make_pattern_window(
 # Generation (greedy, for learning verification)
 # ---------------------------------------------------------------------------
 
+def _gen_scan_body(model, buf, pos_init, key_cache, n_new, lam, temperature, log_rep, vocab_size, rng):
+    """
+    Run n_new autoregressive decode steps via jax.lax.scan.
+
+    buf is RIGHT-padded: prefix occupies [0, pos_init), zeros fill [pos_init, seq_len).
+    Causal attention means the zeros are never attended to from valid positions,
+    so they don't corrupt the logits we actually use.
+
+    Two phases tracked by `pos`:
+      fill  (pos < seq_len): write next token at pos, increment pos
+      slide (pos == seq_len): drop oldest token, append at end (sliding window)
+    """
+    seq_len = buf.shape[1]
+
+    def step(carry, _):
+        tokens_buf, pos, rng = carry
+
+        logits, _ = model(tokens_buf, lam, is_warmup=False,
+                          key_cache=key_cache, use_pallas=False)
+
+        # Read logits at the last valid position
+        read_pos = jnp.minimum(pos - 1, seq_len - 1)
+        logit_vec = logits[0, read_pos].astype(jnp.float32)
+
+        # Repetition penalty on last 64 tokens in the live context
+        seen = jnp.zeros(vocab_size).at[tokens_buf[0, -64:]].add(1.0)
+        logit_vec -= jnp.clip(seen, 0.0, 1.0) * log_rep
+        logit_vec /= temperature
+
+        rng, k = jax.random.split(rng)
+        next_tok = jax.random.categorical(k, logit_vec)
+
+        # Fill while there is room; slide once the window is full
+        new_buf_fill  = tokens_buf.at[0, pos].set(next_tok)
+        new_buf_slide = jnp.concatenate([tokens_buf[:, 1:], next_tok[None, None]], axis=1)
+        new_buf = jnp.where(pos < seq_len, new_buf_fill, new_buf_slide)
+        new_pos = jnp.minimum(pos + 1, seq_len)
+
+        return (new_buf, new_pos, rng), next_tok
+
+    (_, _, _), new_toks = jax.lax.scan(step, (buf, pos_init, rng), None, length=n_new)
+    return new_toks
+
+
+# Compiled once; reused across all generate() calls (model state updates are
+# tracked automatically by nnx.jit).
+_jit_gen_scan = nnx.jit(_gen_scan_body, static_argnames=("n_new", "vocab_size"))
+
+
 def generate(
     model: DWAModel,
     prefix_ids,               # list[int] or 1-D array
@@ -424,25 +516,34 @@ def generate(
     temperature: float = 0.8,
     repetition_penalty: float = 1.3,
 ) -> list[int]:
-    """Temperature-sampled generation with repetition penalty on recent tokens."""
-    tokens = list(map(int, prefix_ids))
+    """
+    Temperature-sampled generation.
+
+    The entire n_new-step decode loop runs inside a single nnx.jit + jax.lax.scan
+    call — no host↔device transfer per token, no re-tracing, key cache computed once.
+    """
     cfg = model.cfg
-    lam = tcfg.lambda_sharpen_end
-    rng = jax.random.PRNGKey(0)
-    for _ in range(n_new):
-        ids = jnp.array(tokens[-cfg.seq_len:], dtype=jnp.int32)[None]   # [1, T]
-        logits, _ = model(ids, lam, is_warmup=False, use_pallas=False)
-        logit_vec = np.array(logits[0, -1], dtype=np.float32)           # host copy
+    seq_len = cfg.seq_len
+    tokens = list(map(int, prefix_ids))
+    prefix_len = min(len(tokens), seq_len)
 
-        # Down-weight tokens seen in the recent context window
-        for t in set(tokens[-64:]):
-            if 0 <= t < len(logit_vec):
-                logit_vec[t] /= repetition_penalty
+    # Right-pad: prefix at [0, prefix_len), zeros at [prefix_len, seq_len).
+    # Causal masking means the trailing zeros never affect logits at valid positions.
+    buf = jnp.zeros((1, seq_len), dtype=jnp.int32)
+    buf = buf.at[0, :prefix_len].set(jnp.array(tokens[-prefix_len:], dtype=jnp.int32))
+    pos_init = jnp.array(prefix_len, dtype=jnp.int32)
 
-        logit_vec /= temperature
-        rng, k = jax.random.split(rng)
-        tokens.append(int(jax.random.categorical(k, jnp.array(logit_vec))))
-    return tokens
+    key_cache = model.pool.compute_keys()
+
+    new_toks = _jit_gen_scan(
+        model, buf, pos_init, key_cache, n_new,
+        float(tcfg.lambda_sharpen_end),
+        temperature,
+        float(jnp.log(repetition_penalty)),
+        cfg.vocab_size,
+        jax.random.PRNGKey(0),
+    )
+    return tokens + [int(t) for t in new_toks]
 
 
 def _verify_learning(
@@ -533,7 +634,11 @@ def _revive_dead_vectors(
     rng      = np.random.default_rng(step)
 
     chosen_donors = rng.choice(donor_idx, size=n_dead, replace=True)
-    noise = rng.normal(0.0, 0.01, (n_dead, cfg.D)).astype(pool_np.dtype)
+    # Noise std 0.2 × donor norm pushes revived vectors far enough from their
+    # donor that IVF routes different queries to them, breaking the feedback loop.
+    donor_norm = float(np.linalg.norm(pool_np[chosen_donors], axis=-1).mean()) + 1e-8
+    noise = rng.normal(0.0, 0.2 * donor_norm / (cfg.D ** 0.5),
+                       (n_dead, cfg.D)).astype(pool_np.dtype)
     pool_np[dead_idx] = pool_np[chosen_donors] + noise
 
     # Put back — honour the existing sharding (model-parallel or replicated)
@@ -594,17 +699,17 @@ def save_checkpoint(
             "pool_ema":       np.array(pool_ema, dtype=np.float32),
             "steps_done":     np.array(steps_done, dtype=np.int32),
             "rng":            np.array(rng),
-            "chunks_fetched": np.array(loader._chunks_fetched if loader else 0, dtype=np.int32),
+            "row_cursor": np.array(loader._cursor if loader else 0, dtype=np.int32),
         },
     }
 
     mngr.save(steps_done, args=ocp.args.StandardSave(save_item))
     mngr.wait_until_finished()
 
-    # Save variable-length token buffer alongside the orbax step directory
-    if loader is not None and loader._buf:
+    # Save packed token buffer alongside the orbax step directory
+    if loader is not None and loader._buf_pos < len(loader._buf):
         buf_path = os.path.join(ckpt_dir, str(steps_done), "buf.npy")
-        np.save(buf_path, np.array(loader._buf, dtype=np.int32))
+        np.save(buf_path, loader._buf[loader._buf_pos :])
 
     print(f"[Ckpt] Saved step {steps_done} → {ckpt_dir}/{steps_done}/")
 
@@ -645,7 +750,7 @@ def load_checkpoint(
             "pool_ema":       jax.ShapeDtypeStruct((cfg.N,), np.float32),
             "steps_done":     jax.ShapeDtypeStruct((), np.int32),
             "rng":            _abstract_like(np.array(jax.random.PRNGKey(0))),
-            "chunks_fetched": jax.ShapeDtypeStruct((), np.int32),
+            "row_cursor": jax.ShapeDtypeStruct((), np.int32),
         },
     }
 
@@ -691,11 +796,11 @@ def load_checkpoint(
     rng         = jnp.array(restored["meta"]["rng"])
     steps_done  = int(restored["meta"]["steps_done"])
 
-    # --- Loader state (buf + chunks_fetched) ---
-    chunks_fetched = int(restored["meta"]["chunks_fetched"])
-    buf_path = os.path.join(ckpt_dir, str(steps_done_target), "buf.npy")
-    buf = list(np.load(buf_path).tolist()) if os.path.exists(buf_path) else []
-    loader_state = {"chunks_fetched": chunks_fetched, "buf": buf}
+    # --- Loader state (cursor + packed buf) ---
+    row_cursor = int(restored["meta"]["row_cursor"])
+    buf_path   = os.path.join(ckpt_dir, str(steps_done_target), "buf.npy")
+    buf        = np.load(buf_path) if os.path.exists(buf_path) else np.empty((0,), dtype=np.int32)
+    loader_state = {"cursor": row_cursor, "buf": buf}
 
     print(f"[Ckpt] Loaded step {steps_done} from {ckpt_dir}/{steps_done_target}/")
     return steps_done, rng, loader_state, pool_ema
@@ -880,7 +985,10 @@ def train(run_cfg: RunConfig) -> None:
           f"  (data={data_label})")
 
     # TinyStories streaming loader (created once; maintains iterator state across windows)
-    loader = TinyStoriesLoader(tokenizer, cfg.seq_len) if tokenizer is not None else None
+    loader = (TinyStoriesLoader(tokenizer, cfg.seq_len,
+                                hf_path=run_cfg.data.hf_path,
+                                text_column=run_cfg.data.hf_text_column)
+              if tokenizer is not None else None)
 
     # Pallas + shard_map is verified correct but hits a TPU VMEM constraint
     # when compiled inside jax.lax.scan + value_and_grad (the scan backward
@@ -897,9 +1005,9 @@ def train(run_cfg: RunConfig) -> None:
         key = (is_warmup, aux_on)
         if key not in compiled_fns:
             compiled_fns[key] = _make_train_window(
-                tcfg, is_warmup, aux_on,
+                cfg, tcfg, is_warmup, aux_on,
                 use_pallas=_use_pallas,
-                mesh=mesh,  # always pass mesh — needed for model-parallel sharding
+                mesh=mesh,
             )
         return compiled_fns[key]
 
