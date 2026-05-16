@@ -630,12 +630,16 @@ def generate(
     tcfg: TrainConfig,
     temperature: float = 0.8,
     repetition_penalty: float = 1.3,
+    eos_token_id: int | None = None,
 ) -> list[int]:
     """
     Temperature-sampled generation.
 
     The entire n_new-step decode loop runs inside a single nnx.jit + jax.lax.scan
     call — no host↔device transfer per token, no re-tracing, key cache computed once.
+
+    If eos_token_id is given, the returned list is truncated at the first EOS token
+    (inclusive) so the caller gets a clean, complete story.
     """
     cfg = model.cfg
     seq_len = cfg.seq_len
@@ -658,7 +662,16 @@ def generate(
         cfg.vocab_size,
         jax.random.PRNGKey(0),
     )
-    return tokens + [int(t) for t in new_toks]
+
+    result = tokens + [int(t) for t in new_toks]
+
+    # Truncate at the first EOS in the newly generated portion
+    if eos_token_id is not None:
+        for i, tok in enumerate(result[len(tokens):], start=len(tokens)):
+            if tok == eos_token_id:
+                return result[:i + 1]   # include the EOS token itself
+
+    return result
 
 
 def _verify_learning(
@@ -690,11 +703,14 @@ def _verify_learning(
 # ---------------------------------------------------------------------------
 
 def _generate_text_sample(model: DWAModel, tokenizer, tcfg: TrainConfig, step: int) -> None:
-    """Generate ~60 tokens from a fixed prompt and print decoded text."""
+    """Generate up to 120 tokens from a fixed prompt, stopping at EOS."""
+    eos = tokenizer.eos_token_id
+    # Prepend BOS so the model sees the same <|endoftext|> it was trained on
     prompt = "Once upon a time"
-    ids    = tokenizer.encode(prompt)
-    out    = generate(model, ids, n_new=60, tcfg=tcfg)
-    text   = tokenizer.decode(out, skip_special_tokens=True)
+    ids    = [eos] + tokenizer.encode(prompt)
+    out    = generate(model, ids, n_new=120, tcfg=tcfg, eos_token_id=eos)
+    # Decode without the leading BOS
+    text   = tokenizer.decode(out[1:], skip_special_tokens=True)
     print(f"\n[DWA] step={step} sample: {text}\n")
 
 
