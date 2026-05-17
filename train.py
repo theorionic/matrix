@@ -57,6 +57,7 @@ from src.dwa.run_config import (
     CheckpointConfig, DataConfig, RunConfig, ShardingConfig,
     load_config, save_config,
 )
+from src.dwa.monitor import LossAdaptiveLRController, PoolCollapseDetector
 from src.dwa.schedule import PhaseScheduler
 from src.dwa.utils import ema_update
 
@@ -65,15 +66,16 @@ from src.dwa.utils import ema_update
 # Optimizer construction
 # ---------------------------------------------------------------------------
 
-def _build_optimizer(model: DWAModel, tcfg: TrainConfig,
-                     scheduler: "PhaseScheduler") -> nnx.Optimizer:
+def _build_tx(model: DWAModel, tcfg: TrainConfig,
+              scheduler: "PhaseScheduler",
+              lr_scale: float = 1.0) -> "optax.GradientTransformation":
     """
-    Per-component learning rates via chained masked Adam optimizers,
-    each with an auto-scheduled LR (linear warmup → constant → cosine decay).
+    Build the optax chain with per-component Adam optimisers.
 
-    The schedule is a JAX array lookup keyed by optax's internal step counter,
-    so it stays on-device and works correctly inside jax.lax.scan and after
-    checkpoint resume (optax step counter is restored with the opt_state).
+    lr_scale multiplies the entire LR schedule (all components equally).
+    Used by the adaptive LR controller: when a plateau is detected, we
+    rebuild only the tx (keeping Adam M/V moments) with a reduced scale.
+    Adam moments are LR-independent, so they remain valid after an LR change.
     """
     pure_params = nnx.as_pure(nnx.state(model, nnx.Param))
     leaves_with_paths, treedef = jax.tree_util.tree_flatten_with_path(pure_params)
@@ -92,17 +94,29 @@ def _build_optimizer(model: DWAModel, tcfg: TrainConfig,
         flags = [_label(path) == target_label for path, _ in leaves_with_paths]
         return jax.tree_util.tree_unflatten(treedef, flags)
 
-    tx = optax.chain(
-        optax.clip_by_global_norm(tcfg.grad_clip_norm),   # must be first
-        optax.masked(optax.adam(scheduler.make_optax_schedule(tcfg.lr_pool)),
-                     _make_mask("pool")),
-        optax.masked(optax.adam(scheduler.make_optax_schedule(tcfg.lr_threshold)),
-                     _make_mask("threshold")),
-        optax.masked(optax.adam(scheduler.make_optax_schedule(tcfg.lr_retrieval)),
-                     _make_mask("retrieval")),
-        optax.masked(optax.adam(scheduler.make_optax_schedule(tcfg.lr_parts)),
-                     _make_mask("parts")),
+    def _sched(base_lr: float):
+        return scheduler.make_optax_schedule(base_lr * lr_scale)
+
+    return optax.chain(
+        optax.clip_by_global_norm(tcfg.grad_clip_norm),
+        optax.masked(optax.adam(_sched(tcfg.lr_pool)),       _make_mask("pool")),
+        optax.masked(optax.adam(_sched(tcfg.lr_threshold)),  _make_mask("threshold")),
+        optax.masked(optax.adam(_sched(tcfg.lr_retrieval)),  _make_mask("retrieval")),
+        optax.masked(optax.adam(_sched(tcfg.lr_parts)),      _make_mask("parts")),
     )
+
+
+def _build_optimizer(model: DWAModel, tcfg: TrainConfig,
+                     scheduler: "PhaseScheduler") -> nnx.Optimizer:
+    """
+    Per-component learning rates via chained masked Adam optimizers,
+    each with an auto-scheduled LR (linear warmup → constant → cosine decay).
+
+    The schedule is a JAX array lookup keyed by optax's internal step counter,
+    so it stays on-device and works correctly inside jax.lax.scan and after
+    checkpoint resume (optax step counter is restored with the opt_state).
+    """
+    tx = _build_tx(model, tcfg, scheduler, lr_scale=1.0)
     return nnx.Optimizer(model, tx, wrt=nnx.Param)
 
 
@@ -1213,6 +1227,14 @@ def train(run_cfg: RunConfig) -> None:
     # Last computed validation loss (updated every val_every steps)
     _last_val_loss: float | None = None
 
+    # Advanced pool collapse detector and adaptive LR controller.
+    # LR controller: when a plateau/divergence is detected, optimizer.tx is
+    # rebuilt with a new lr_scale multiplier (Adam M/V moments are preserved
+    # since they are LR-independent; only the schedule magnitude changes).
+    collapse_detector = PoolCollapseDetector(cfg.N, cfg.k_max)
+    lr_ctrl           = LossAdaptiveLRController()
+    _current_lr_scale  = 1.0   # tracks the live scale for log display
+
     t0 = time.time()
     for window_idx in range(start_window, n_windows):
         start_step = window_idx * tcfg.steps_per_window
@@ -1244,7 +1266,7 @@ def train(run_cfg: RunConfig) -> None:
         train_fn = get_train_fn(is_warmup, aux_on)
         t_win = time.time()
         model, optimizer, pool_ema, info = train_fn(
-            model, optimizer, data_sharded, lam_window, pool_ema, tcfg.ema_decay
+            model, optimizer, data_sharded, lam_window, pool_ema, tcfg.ema_decay,
         )
         # Block until TPU computation finishes before timing
         jax.block_until_ready(
@@ -1269,11 +1291,14 @@ def train(run_cfg: RunConfig) -> None:
             _ss_steps += tcfg.steps_per_window
             _ss_time  += win_secs
         val_str = f"  val={_last_val_loss:.4f}" if _last_val_loss is not None else ""
-        lr_scale = scheduler.get_lr_scale(start_step)
+        lr_base = scheduler.get_lr_scale(start_step)
+        lr_eff  = lr_base * _current_lr_scale
+        lr_str  = (f"lr={lr_base:.3f}×{_current_lr_scale:.3f}={lr_eff:.4f}"
+                   if abs(_current_lr_scale - 1.0) > 0.001 else f"lr={lr_base:.3f}")
         print(
             f"[DWA] step={steps_done:6d}/{tcfg.total_steps} "
             f"phase={phase:8s} λ={scheduler.get_lambda(start_step):.2f} "
-            f"lr={lr_scale:.3f} "
+            f"{lr_str} "
             f"loss={mean_loss:.4f}{val_str} "
             f"win={win_secs:.1f}s  steps/s={win_steps_per_sec:.1f}  "
             f"tok/s={win_tok_per_sec:,}  TFLOP/s={achieved_tflops:.1f}"
@@ -1318,22 +1343,33 @@ def train(run_cfg: RunConfig) -> None:
                 print(f"[Safety] CRITICAL: NaN/Inf in parameter '{bad_name}'. Stopping.")
                 break
 
-        # 4. Pool-collapse check: unique vectors retrieved + EMA entropy
-        last_idx     = np.array(info["last_indices"])   # [B, k_max] on host
-        n_unique     = int(np.unique(last_idx).shape[0])
-        max_possible = min(tcfg.batch_size * cfg.k_max, cfg.N)
-        ema_np   = np.array(pool_ema)
-        ema_norm = ema_np / (ema_np.sum() + 1e-8)
-        entropy  = float(-np.sum(ema_norm * np.log(ema_norm + 1e-8)))
-        n_active = int((ema_np > 0.01 * ema_np.mean()).sum())
-        collapse_flag = n_unique < cfg.k_max * 2
-        print(
-            f"[Pool] unique={n_unique}/{max_possible}  "
-            f"active={n_active}/{cfg.N}  "
-            f"entropy={entropy / np.log(cfg.N):.3f}  "
-            f"gnorm_mean={mean_gnorm:.3f} max={max_gnorm:.3f}"
-            + ("  [COLLAPSE RISK]" if collapse_flag else "")
-        )
+        # 4. Pool-collapse detector (multi-signal, state machine)
+        last_idx      = np.array(info["last_indices"])   # [B, k_max] on host
+        collapse_info = collapse_detector.update(np.array(pool_ema), last_idx)
+        print(collapse_detector.format_line(collapse_info) +
+              f"  gnorm={mean_gnorm:.3f}(max={max_gnorm:.3f})")
+        if collapse_info["changed"]:
+            print(f"[Collapse] State → {collapse_info['state']}  "
+                  f"(entropy_slope={collapse_info['entropy_slope']:+.4f}/w  "
+                  f"active_slope={collapse_info['active_slope']:+.4f}/w)")
+        if "revive_now" in collapse_info["actions"]:
+            n_revived = _revive_dead_vectors(model, pool_ema, cfg, tcfg, steps_done)
+            print(f"[Collapse] CRITICAL: immediately revived {n_revived}/{cfg.N} vectors.")
+
+        # 4b. Loss-adaptive LR controller
+        lr_ctrl_info = lr_ctrl.update(mean_loss, mean_gnorm)
+        print(lr_ctrl.format_line(lr_ctrl_info))
+        if lr_ctrl_info["event"]:
+            # Rebuild optimizer.tx with new LR scale (preserves Adam M/V moments).
+            # Adam's moments are LR-independent (they track gradient statistics),
+            # so carrying them over to the new schedule is mathematically correct.
+            # The next window will trigger a JIT recompile (~1× cost, acceptable
+            # since LR reductions happen at most ~3 times per training run).
+            _current_lr_scale = lr_ctrl_info["lr_scale"]
+            optimizer.tx = _build_tx(model, tcfg, scheduler, _current_lr_scale)
+            compiled_fns.clear()  # force recompile with new schedule
+            print(f"[LR]   Rebuilt optimizer schedule: ×{_current_lr_scale:.4f} "
+                  f"(recompile next window)")
 
         # Text generation check every gen_every steps
         prev_steps = steps_done - tcfg.steps_per_window
