@@ -64,6 +64,18 @@ class CheckpointConfig:
 
 
 @dataclass
+class WandbConfig:
+    """Weights & Biases integration."""
+    enabled: bool  = False
+    project: str   = "dwa-training"
+    entity:  str   = ""      # team or username; empty → default
+    name:    str   = ""      # run display name; empty → RunConfig.name
+    tags:    list  = field(default_factory=list)
+    notes:   str   = ""
+    log_every: int = 1       # log every N windows (1 = every window)
+
+
+@dataclass
 class RunConfig:
     """Full configuration for one training run."""
     model:      DWAConfig       = field(default_factory=DWAConfig.small)
@@ -71,6 +83,7 @@ class RunConfig:
     sharding:   ShardingConfig  = field(default_factory=ShardingConfig)
     data:       DataConfig      = field(default_factory=DataConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    wandb:      WandbConfig     = field(default_factory=WandbConfig)
     name: str = "dwa_run"
 
 
@@ -82,6 +95,7 @@ _MODEL_FIELDS  = {f.name for f in dataclasses.fields(DWAConfig)}
 _TRAIN_FIELDS  = {f.name for f in dataclasses.fields(TrainConfig)}
 _DATA_FIELDS   = {f.name for f in dataclasses.fields(DataConfig)}
 _CKPT_FIELDS   = {f.name for f in dataclasses.fields(CheckpointConfig)}
+_WANDB_FIELDS  = {f.name for f in dataclasses.fields(WandbConfig)}
 
 
 def _parse_compute_dtype(value: str | None):
@@ -179,12 +193,20 @@ def load_config(path: str) -> RunConfig:
         raise ValueError(f"Unknown checkpoint config keys: {unknown_c}")
     ckpt_cfg = CheckpointConfig(**ckpt_raw)
 
+    # Wandb
+    wandb_raw = raw.get("wandb", {})
+    unknown_w = set(wandb_raw) - _WANDB_FIELDS
+    if unknown_w:
+        raise ValueError(f"Unknown wandb config keys: {unknown_w}")
+    wandb_cfg = WandbConfig(**wandb_raw)
+
     return RunConfig(
         model=model_cfg,
         train=train_cfg,
         sharding=sharding_cfg,
         data=data_cfg,
         checkpoint=ckpt_cfg,
+        wandb=wandb_cfg,
         name=raw.get("name", "dwa_run"),
     )
 
@@ -198,6 +220,7 @@ def to_dict(run_cfg: RunConfig) -> dict:
         "sharding": {"n_model": run_cfg.sharding.n_model},
         "data": dataclasses.asdict(run_cfg.data),
         "checkpoint": dataclasses.asdict(run_cfg.checkpoint),
+        "wandb": dataclasses.asdict(run_cfg.wandb),
     }
 
 

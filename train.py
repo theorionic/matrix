@@ -54,8 +54,8 @@ from src.dwa.config import DWAConfig, TrainConfig
 from src.dwa.losses import task_loss
 from src.dwa.model import DWAModel, forward_and_loss
 from src.dwa.run_config import (
-    CheckpointConfig, DataConfig, RunConfig, ShardingConfig,
-    load_config, save_config,
+    CheckpointConfig, DataConfig, RunConfig, ShardingConfig, WandbConfig,
+    load_config, save_config, to_dict,
 )
 from src.dwa.monitor import LossAdaptiveLRController, PoolCollapseDetector
 from src.dwa.schedule import PhaseScheduler
@@ -1212,6 +1212,30 @@ def train(run_cfg: RunConfig) -> None:
           f"spike_sigma={tcfg.loss_spike_sigma}σ  "
           f"revival_every={tcfg.revival_interval_steps}s")
 
+    # ── Weights & Biases ─────────────────────────────────────────────────────
+    _wb = None
+    _wb_log_every = run_cfg.wandb.log_every
+    if run_cfg.wandb.enabled:
+        try:
+            import wandb as _wandb_mod
+            _wb = _wandb_mod.init(
+                project  = run_cfg.wandb.project,
+                entity   = run_cfg.wandb.entity   or None,
+                name     = run_cfg.wandb.name     or run_cfg.name,
+                tags     = run_cfg.wandb.tags     or None,
+                notes    = run_cfg.wandb.notes    or None,
+                config   = to_dict(run_cfg),
+                resume   = "allow",
+                id       = run_cfg.wandb.name     or run_cfg.name,
+            )
+            print(f"[W&B]  Run: {_wb.url}")
+        except ImportError:
+            print("[W&B]  wandb not installed — skipping. Run: pip install wandb")
+
+    def _wlog(metrics: dict, step: int) -> None:
+        if _wb is not None:
+            _wb.log(metrics, step=step)
+
     # Steady-state tracking
     # _win_times_rolling: all recent window durations (rolling window of 10).
     # Compile detection: a window is "compile" if it is >3× the minimum of the
@@ -1376,10 +1400,11 @@ def train(run_cfg: RunConfig) -> None:
 
         # 5. Dead vector revival (boundary-crossing check so it fires every
         #    ~revival_interval_steps regardless of steps_per_window alignment)
+        _n_revived_this_win = 0
         if (steps_done // tcfg.revival_interval_steps) > (prev_steps // tcfg.revival_interval_steps):
-            n_revived = _revive_dead_vectors(model, pool_ema, cfg, tcfg, steps_done)
-            if n_revived > 0:
-                print(f"[Safety] Revived {n_revived}/{cfg.N} dead pool vectors.")
+            _n_revived_this_win = _revive_dead_vectors(model, pool_ema, cfg, tcfg, steps_done)
+            if _n_revived_this_win > 0:
+                print(f"[Safety] Revived {_n_revived_this_win}/{cfg.N} dead pool vectors.")
 
         # Validation loss (boundary crossing — fires every val_every steps)
         if val_cache is not None and val_every > 0 and \
@@ -1388,9 +1413,50 @@ def train(run_cfg: RunConfig) -> None:
             _last_val_loss = _compute_val_loss(model, val_cache, lam_val, mesh)
             print(f"[Val]  step={steps_done:6d}  train={mean_loss:.4f}  val={_last_val_loss:.4f}  "
                   f"gap={_last_val_loss - mean_loss:+.4f}")
+            _wlog({"val/loss": _last_val_loss, "val/gap": _last_val_loss - mean_loss},
+                  step=steps_done)
 
         if tokenizer is not None and (steps_done // gen_every) > (prev_steps // gen_every):
             _generate_text_sample(model, tokenizer, tcfg, steps_done)
+
+        # ── W&B per-window log ────────────────────────────────────────────────
+        if window_idx % _wb_log_every == 0:
+            _collapse_state_int = {"OK": 0, "WARNING": 1, "CRITICAL": 2, "COLLAPSED": 3}
+            _wlog({
+                # Training
+                "train/loss":            mean_loss,
+                "train/loss_fast":       lr_ctrl_info["loss_fast"],
+                "train/loss_slow":       lr_ctrl_info["loss_slow"],
+                "train/grad_norm_mean":  mean_gnorm,
+                "train/grad_norm_max":   max_gnorm,
+                "train/nan_count":       int(info["nan_flags"].sum()),
+                "train/phase":           phase,
+                "train/lambda":          scheduler.get_lambda(start_step),
+                # Learning rate
+                "lr/base_scale":         lr_base,
+                "lr/adaptive_scale":     _current_lr_scale,
+                "lr/effective":          lr_base * _current_lr_scale,
+                "lr/improvement_rate":   lr_ctrl_info["improvement_rate"],
+                "lr/plateau_count":      lr_ctrl_info["no_improve"],
+                "lr/cooldown":           lr_ctrl_info["cooldown"],
+                "lr/n_reductions":       lr_ctrl_info["n_reductions"],
+                # Pool collapse
+                "pool/entropy":          collapse_info["entropy"],
+                "pool/entropy_slope":    collapse_info["entropy_slope"],
+                "pool/active_frac":      collapse_info["active_frac"],
+                "pool/active_slope":     collapse_info["active_slope"],
+                "pool/unique_frac":      collapse_info["unique_frac"],
+                "pool/gini":             collapse_info["gini"],
+                "pool/top10_conc":       collapse_info["top10_conc"],
+                "pool/state":            _collapse_state_int[collapse_info["state"]],
+                "pool/revived":          _n_revived_this_win,
+                # Performance
+                "perf/steps_per_sec":   win_steps_per_sec,
+                "perf/tokens_per_sec":  win_tok_per_sec,
+                "perf/tflops":          achieved_tflops,
+                "perf/window_secs":     win_secs,
+                "perf/is_compile":      int(is_compile_win),
+            }, step=steps_done)
 
         # Checkpoint save (boundary crossing check avoids double-saves at resume)
         if ckpt_dir and ckpt_every > 0 and (steps_done // ckpt_every) > (prev_steps // ckpt_every):
@@ -1406,17 +1472,30 @@ def train(run_cfg: RunConfig) -> None:
     elapsed_total = time.time() - t0
     print(f"[DWA] Training complete in {elapsed_total:.1f}s")
     if _ss_time > 0:
-        ss_sps  = _ss_steps / _ss_time
+        ss_sps    = _ss_steps / _ss_time
         ss_tflops = step_flops * ss_sps / 1e12
-        ss_tok   = int(ss_sps * tcfg.batch_size * cfg.seq_len)
-        # TPU v5 lite BF16 MXU peak: 197 TFLOP/s per chip
+        ss_tok    = int(ss_sps * tcfg.batch_size * cfg.seq_len)
         peak = 197.0 * n_devices if "v5" in device_kind.lower() else None
-        mfu_str = (f"  MFU={ss_tflops/peak*100:.2f}% (vs {peak:.0f} TFLOP/s BF16 peak)"
-                   if peak else "")
+        mfu  = ss_tflops / peak * 100 if peak else None
+        mfu_str = (f"  MFU={mfu:.2f}% (vs {peak:.0f} TFLOP/s BF16 peak)" if peak else "")
         print(f"[DWA] Steady-state throughput: {ss_sps:.0f} steps/s  "
               f"{ss_tok:,} tok/s  {ss_tflops:.1f} TFLOP/s{mfu_str}")
         compile_secs = elapsed_total - _ss_time
         print(f"[DWA] Time breakdown: {_ss_time:.1f}s training + {compile_secs:.1f}s XLA compilation")
+        if _wb is not None:
+            _wb.summary.update({
+                "summary/ss_steps_per_sec": ss_sps,
+                "summary/ss_tok_per_sec":   ss_tok,
+                "summary/ss_tflops":        ss_tflops,
+                "summary/mfu_pct":          mfu or 0.0,
+                "summary/train_secs":       _ss_time,
+                "summary/compile_secs":     compile_secs,
+                "summary/total_steps":      steps_done,
+                "summary/lr_reductions":    lr_ctrl._n_reductions,
+            })
+
+    if _wb is not None:
+        _wb.finish()
 
     if use_pattern:
         _verify_learning(model, cfg, tcfg)
