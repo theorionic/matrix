@@ -33,7 +33,7 @@ train:
   lambda_gate_start: 1.0
   lambda_gate_end: 5.0
   lambda_sharpen_end: 10.0
-  lambda_util: 0.01
+  lambda_util: 1.0
   lambda_div: 0.01
   lambda_norm: 0.001
   lambda_sparse: 0.001
@@ -41,6 +41,7 @@ train:
   lr_parts: 0.0001
   lr_retrieval: 0.0001
   lr_threshold: 0.001
+  lr_min_scale: 1.0
   batch_size: 128
   steps_per_window: 32
   seed: 42
@@ -50,12 +51,16 @@ train:
   nan_emergency_stop: 5
   loss_spike_sigma: 5.0
   dead_vector_threshold: 1.0e-06
-  revival_interval_steps: 1000
+  revival_interval_steps: 500
 sharding:
   n_model: auto
 data:
-  source: random
-  gen_every: 100
+  source: tiny_stories
+  hf_path: roneneldan/TinyStories
+  hf_text_column: text
+  gen_every: 500
+  val_every: 500
+  val_batches: 32
 checkpoint:
   dir: ''
   every: 1000
