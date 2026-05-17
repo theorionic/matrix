@@ -1228,7 +1228,8 @@ def train(run_cfg: RunConfig) -> None:
                 resume   = "allow",
                 id       = run_cfg.wandb.name     or run_cfg.name,
             )
-            print(f"[W&B]  Run: {_wb.url}")
+            url_str = _wb.url or f"offline ({_wb.dir})"
+            print(f"[W&B]  Run: {url_str}")
         except ImportError:
             print("[W&B]  wandb not installed — skipping. Run: pip install wandb")
 
