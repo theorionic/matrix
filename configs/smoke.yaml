@@ -1,0 +1,73 @@
+# Smoke-test config — runs 64 steps in ~30s to verify the framework end-to-end
+#
+# Run:
+#   python train.py --config configs/smoke.yaml
+#
+name: smoke
+model:
+  D: 2048
+  N: 64
+  use_ivf: true
+  C: 4
+  m: 2
+  d_A: 64
+  d_B: 64
+  r: 4
+  k_max: 4
+  S: 2
+  d_k: 32
+  T: 1.0
+  n_heads: 2
+  n_kv_heads: 1
+  use_rope: true
+  n_layers_A: 2
+  n_layers_B: 2
+  ffn_mult: 2
+  vocab_size: 32000
+  seq_len: 64
+  gamma_init: 0.1
+  bf16_pool: false
+  compute_dtype: float32
+  remat: false
+  use_flash_attn: false
+  vocab_parallel: false
+train:
+  warmup_steps: 16
+  gate_on_steps: 32
+  total_steps: 64
+  lambda_gate_start: 1.0
+  lambda_gate_end: 5.0
+  lambda_sharpen_end: 10.0
+  lambda_util: 0.01
+  lambda_div: 0.01
+  lambda_norm: 0.001
+  lambda_sparse: 0.001
+  lr_pool: 3.0e-05
+  lr_parts: 1.0e-04
+  lr_retrieval: 1.0e-04
+  lr_threshold: 1.0e-03
+  lr_min_scale: 0.1
+  batch_size: 8
+  steps_per_window: 8
+  seed: 0
+  lr_warmup_steps: 8
+  ema_decay: 0.99
+  grad_clip_norm: 1.0
+  nan_emergency_stop: 5
+  loss_spike_sigma: 5.0
+  dead_vector_threshold: 1.0e-06
+  revival_interval_steps: 32
+sharding:
+  n_model: 1
+data:
+  source: tiny_stories
+  hf_path: roneneldan/TinyStories
+  hf_text_column: text
+  gen_every: 64
+  val_every: 64
+  val_batches: 2
+checkpoint:
+  dir: ''
+  every: 0
+  resume: false
+  keep: 1

@@ -259,7 +259,10 @@ def shard_pallas_assemble(
     backward is also mapped per-shard; gradients for replicated inputs
     (W_base, b_base, gamma) are all-reduced by shard_map automatically.
     """
-    from jax.experimental.shard_map import shard_map
+    try:
+        from jax import shard_map
+    except ImportError:
+        from jax.experimental.shard_map import shard_map
     from jax.sharding import PartitionSpec as P
 
     def _fn(g, a, h, wb, bb, gm):

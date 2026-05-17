@@ -24,7 +24,10 @@ def _distributed_gather(pool_vecs, indices, mesh):
     entries that don't belong to it, then psum across the model axis
     to combine — only one shard contributes non-zero for each index.
     """
-    from jax.experimental.shard_map import shard_map
+    try:
+        from jax import shard_map
+    except ImportError:
+        from jax.experimental.shard_map import shard_map
     from jax.sharding import PartitionSpec as P
 
     def _fn(local_pool, local_idx):
@@ -61,7 +64,10 @@ def _vocab_parallel_cross_entropy(
         loss = -log(exp(z_target) / sum_v exp(z_v))
              = log_sum_exp(all z) - z_target
     """
-    from jax.experimental.shard_map import shard_map as _smap
+    try:
+        from jax import shard_map as _smap
+    except ImportError:
+        from jax.experimental.shard_map import shard_map as _smap
     from jax.sharding import PartitionSpec as _P
 
     V_local = V // n_model

@@ -1199,8 +1199,12 @@ def train(run_cfg: RunConfig) -> None:
           f"revival_every={tcfg.revival_interval_steps}s")
 
     # Steady-state tracking
+    # _win_times_rolling: all recent window durations (rolling window of 10).
+    # Compile detection: a window is "compile" if it is >3× the minimum of the
+    # last 10 durations.  Bootstrapping: the first 2 windows are always excluded
+    # so that long compile windows don't set a falsely high baseline.
     _ss_steps, _ss_time = 0, 0.0
-    _win_min = float("inf")
+    _win_times_rolling: deque = deque(maxlen=10)
 
     # Safety state
     _consecutive_nan = 0
@@ -1255,12 +1259,15 @@ def train(run_cfg: RunConfig) -> None:
         win_tok_per_sec = int(win_steps_per_sec * tcfg.batch_size * cfg.seq_len)
 
         achieved_tflops = step_flops * win_steps_per_sec / 1e12
-        compile_thresh = (max(3.0, 4.0 * _win_min) if _win_min < float("inf") else 3.0)
-        is_compile_win = win_secs > compile_thresh
+        _win_times_rolling.append(win_secs)
+        recent_min = min(_win_times_rolling)
+        # A window is compile if fewer than 3 windows seen yet, or if this
+        # window took >3× the fastest recent window (XLA recompilation spike).
+        is_compile_win = (len(_win_times_rolling) < 3
+                          or win_secs > 3.0 * recent_min)
         if not is_compile_win:
             _ss_steps += tcfg.steps_per_window
             _ss_time  += win_secs
-            _win_min   = min(_win_min, win_secs)
         val_str = f"  val={_last_val_loss:.4f}" if _last_val_loss is not None else ""
         lr_scale = scheduler.get_lr_scale(start_step)
         print(

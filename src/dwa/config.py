@@ -65,6 +65,9 @@ class DWAConfig:
             assert self.N % self.C == 0, (
                 f"N={self.N} must be divisible by C={self.C} for IVF equal-size buckets"
             )
+            assert self.m <= self.C, (
+                f"m={self.m} (clusters searched) must be ≤ C={self.C} (total clusters)"
+            )
 
     @classmethod
     def small(cls) -> "DWAConfig":

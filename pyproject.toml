@@ -1,7 +1,17 @@
 [project]
 name = "matrix"
 version = "0.1.0"
-description = "Add your description here"
+description = "Dynamic Weight Assembly (DWA) model training on TPU v5 lite"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]

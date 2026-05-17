@@ -1,0 +1,90 @@
+# Production config for 8× TPU v5 lite (16 GB/device = 128 GB total)
+#
+# Design targets
+#   - BF16 compute → ~4× MXU throughput vs float32
+#   - d_A=256 → 2× larger GEMM tiles than medium (d=128), good MXU fill
+#   - seq_len=512, batch=256 (32/device) → enough arithmetic intensity
+#   - remat=true → activation checkpointing, halves peak activation memory
+#   - Pool 16K×16K in BF16: 512 MB; Adam (f32): 2×1 GB = 2 GB; total ~2.5 GB/device (replicated)
+#   - Transformer params: ~130 MB; activations (remat): ~800 MB/device
+#   - Total HBM/device: ~3.5 GB  (well within 16 GB)
+#
+# Run:
+#   python train.py --config configs/tpu_v5lite_prod.yaml --ckpt-dir checkpoints/prod --resume
+#
+name: tpu_v5lite_prod
+model:
+  # Pool
+  D: 16384        # vector dim; covers d_B*r + r*d_A + d_B = 256*24 + 24*256 + 256 = 12544
+  N: 16384        # 16K pool vectors
+  use_ivf: true
+  C: 64           # N/C = 256 vectors/cluster
+  m: 8            # search 8×256 = 2048 candidates (12.5% of pool)
+  # Transformer
+  d_A: 256
+  d_B: 256
+  r: 24
+  k_max: 16
+  S: 4
+  d_k: 64
+  T: 1.0
+  n_heads: 4
+  n_kv_heads: 1   # MQA — single KV head, 4 query heads
+  use_rope: true
+  n_layers_A: 6
+  n_layers_B: 6
+  ffn_mult: 4     # d_ff = 1024
+  # Vocab / seq
+  vocab_size: 32000
+  seq_len: 512
+  # Init / precision
+  gamma_init: 0.1
+  bf16_pool: true
+  compute_dtype: bfloat16   # 4× MXU throughput on v5 lite
+  remat: true               # activation checkpointing
+  use_flash_attn: false
+  vocab_parallel: true
+train:
+  warmup_steps: 1000
+  gate_on_steps: 10000
+  total_steps: 100000
+  lambda_gate_start: 1.0
+  lambda_gate_end: 5.0
+  lambda_sharpen_end: 10.0
+  # Aux loss weights — balanced to prevent pool collapse
+  lambda_util: 0.01
+  lambda_div: 0.01
+  lambda_norm: 0.001
+  lambda_sparse: 0.001
+  # Per-component LRs
+  lr_pool: 3.0e-05
+  lr_parts: 1.0e-04
+  lr_retrieval: 1.0e-04
+  lr_threshold: 1.0e-03
+  lr_min_scale: 0.1      # cosine decay floor at 10% of base LR
+  # Batching — 32 seqs/device across 8 devices
+  batch_size: 256
+  steps_per_window: 64   # 64 steps inside each jax.lax.scan call
+  seed: 42
+  lr_warmup_steps: 500
+  ema_decay: 0.99
+  # Safety
+  grad_clip_norm: 1.0
+  nan_emergency_stop: 5
+  loss_spike_sigma: 5.0
+  dead_vector_threshold: 1.0e-06
+  revival_interval_steps: 2000
+sharding:
+  n_model: 1    # 8-way data parallel; pool replicated per device
+data:
+  source: tiny_stories
+  hf_path: roneneldan/TinyStories
+  hf_text_column: text
+  gen_every: 2000
+  val_every: 2000
+  val_batches: 32
+checkpoint:
+  dir: checkpoints/prod
+  every: 5000
+  resume: false
+  keep: 5

@@ -3,7 +3,10 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.experimental.shard_map import shard_map
+try:
+    from jax import shard_map
+except ImportError:
+    from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 
 from .config import DWAConfig

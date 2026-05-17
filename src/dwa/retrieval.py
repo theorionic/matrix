@@ -87,14 +87,15 @@ class MultiAspectRetrieval(nnx.Module):
             )
             c_sim   = jnp.einsum("bsk,sck->bsc", q_norm, c_norm)   # [B, S, C]
             c_score = jnp.einsum("s,bsc->bc", w, c_sim)             # [B, C]
-            _, top_clusters = jax.lax.top_k(c_score, cfg.m)         # [B, m]
+            m_eff = min(cfg.m, cfg.C)
+            _, top_clusters = jax.lax.top_k(c_score, m_eff)         # [B, m_eff]
 
             # ── Stage 2: exact search within selected clusters ────────────────
             N_per_C = cfg.N // cfg.C
             cand_idx = (
                 top_clusters[:, :, None] * N_per_C
                 + jnp.arange(N_per_C)[None, None, :]
-            ).reshape(B, cfg.m * N_per_C)                            # [B, K_refine]
+            ).reshape(B, m_eff * N_per_C)                            # [B, K_refine]
 
             keys_refine = jax.vmap(lambda idx: pool_keys[:, idx, :])(cand_idx)
             # → [B, S, K_refine, d_k]
