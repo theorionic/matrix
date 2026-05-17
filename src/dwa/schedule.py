@@ -46,9 +46,10 @@ class PhaseScheduler:
             return step / max(cfg.lr_warmup_steps, 1)
         if step < cfg.gate_on_steps:
             return 1.0
-        # cosine decay from gate_on_steps to total_steps
+        # cosine decay from gate_on_steps to total_steps, floored at lr_min_scale
         t = (step - cfg.gate_on_steps) / max(cfg.total_steps - cfg.gate_on_steps, 1)
-        return 0.5 * (1.0 + math.cos(math.pi * min(t, 1.0)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(t, 1.0)))
+        return cfg.lr_min_scale + (1.0 - cfg.lr_min_scale) * cosine
 
     def aux_enabled(self, step: int) -> bool:
         return step >= self.cfg.warmup_steps
@@ -61,3 +62,18 @@ class PhaseScheduler:
     def make_lr_scale_array(self, total_steps: int | None = None) -> jnp.ndarray:
         n = total_steps or self.cfg.total_steps
         return jnp.array([self.get_lr_scale(s) for s in range(n)])
+
+    def make_optax_schedule(self, base_lr: float):
+        """
+        Returns a JAX-compatible schedule function (optax step count → lr).
+
+        The pre-computed lr_scale array is captured in a closure so the
+        schedule is a pure array lookup — no Python branching inside JIT.
+        Clamps the index at total_steps-1 so the function is defined beyond
+        the training horizon (e.g. during checkpoint-resumed runs).
+        """
+        lr_arr = self.make_lr_scale_array()   # [total_steps], float32
+        def schedule(count):
+            idx = jnp.minimum(count, lr_arr.shape[0] - 1)
+            return base_lr * lr_arr[idx]
+        return schedule

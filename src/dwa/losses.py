@@ -25,21 +25,14 @@ def aux_losses(
 
     # L_util: Switch Transformer-style load-balancing loss.
     #
-    # entropy alone doesn't prevent collapse because it only touches key
-    # projections — assembly factors (U,V,b) get zero gradient for unselected
-    # vectors.  The Switch loss couples the HARD selection frequency (f_i, which
-    # drives the task gradient) with the SOFT probability (P_i, which is
-    # differentiable), so the optimizer is penalised every time the hard
-    # selections concentrate on a small subset.
-    #
     # f_i  = fraction of (batch × k) selections that chose vector i  [N]
     # P_i  = mean soft probability assigned to vector i               [N]
-    # l_lb = N × Σ_i f_i × P_i
+    # l_util = N × Σ_i f_i × P_i
     #      → 1.0 when perfectly uniform, → N when fully collapsed to 1 vector
     #
     # Gradient w.r.t. soft_full[b,i]: N × f_i / B
     #   • heavy hitters (high f_i) get penalised → model lowers their P_i
-    #   • via softmax normalisation this raises P_i for dead vectors
+    #   • via softmax normalisation this raises P_i for underused vectors
     flat_idx = indices.reshape(-1)                               # [B*k]
     f = jnp.zeros(N).at[flat_idx].add(1.0) / (B * k)           # [N], sums to 1
     P = soft_full.mean(axis=0)                                   # [N]

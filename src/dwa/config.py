@@ -204,6 +204,8 @@ class TrainConfig:
     dead_vector_threshold: float = 1e-6  # EMA below this → vector considered dead
     revival_interval_steps: int = 1000   # how often to revive dead pool vectors
 
+    lr_min_scale: float = 1.0
+
     @property
     def lr_warmup(self) -> int:
         return self.lr_warmup_steps

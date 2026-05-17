@@ -65,12 +65,15 @@ from src.dwa.utils import ema_update
 # Optimizer construction
 # ---------------------------------------------------------------------------
 
-def _build_optimizer(model: DWAModel, tcfg: TrainConfig) -> nnx.Optimizer:
+def _build_optimizer(model: DWAModel, tcfg: TrainConfig,
+                     scheduler: "PhaseScheduler") -> nnx.Optimizer:
     """
-    Per-component learning rates via chained masked Adam optimizers.
+    Per-component learning rates via chained masked Adam optimizers,
+    each with an auto-scheduled LR (linear warmup → constant → cosine decay).
 
-    Labels are derived from the pure (un-NNX-wrapped) parameter structure
-    so they are compatible with what nnx.Optimizer passes to optax internally.
+    The schedule is a JAX array lookup keyed by optax's internal step counter,
+    so it stays on-device and works correctly inside jax.lax.scan and after
+    checkpoint resume (optax step counter is restored with the opt_state).
     """
     pure_params = nnx.as_pure(nnx.state(model, nnx.Param))
     leaves_with_paths, treedef = jax.tree_util.tree_flatten_with_path(pure_params)
@@ -91,10 +94,14 @@ def _build_optimizer(model: DWAModel, tcfg: TrainConfig) -> nnx.Optimizer:
 
     tx = optax.chain(
         optax.clip_by_global_norm(tcfg.grad_clip_norm),   # must be first
-        optax.masked(optax.adam(tcfg.lr_pool), _make_mask("pool")),
-        optax.masked(optax.adam(tcfg.lr_threshold), _make_mask("threshold")),
-        optax.masked(optax.adam(tcfg.lr_retrieval), _make_mask("retrieval")),
-        optax.masked(optax.adam(tcfg.lr_parts), _make_mask("parts")),
+        optax.masked(optax.adam(scheduler.make_optax_schedule(tcfg.lr_pool)),
+                     _make_mask("pool")),
+        optax.masked(optax.adam(scheduler.make_optax_schedule(tcfg.lr_threshold)),
+                     _make_mask("threshold")),
+        optax.masked(optax.adam(scheduler.make_optax_schedule(tcfg.lr_retrieval)),
+                     _make_mask("retrieval")),
+        optax.masked(optax.adam(scheduler.make_optax_schedule(tcfg.lr_parts)),
+                     _make_mask("parts")),
     )
     return nnx.Optimizer(model, tx, wrt=nnx.Param)
 
@@ -1112,7 +1119,7 @@ def train(run_cfg: RunConfig) -> None:
     rng = jax.random.PRNGKey(tcfg.seed)
     sharded_pool = _make_sharded_pool_vectors(cfg, mesh, rng)  # None if n_model==1
     model = DWAModel(cfg, nnx.Rngs(rng), pool_vectors=sharded_pool)
-    optimizer = _build_optimizer(model, tcfg)
+    optimizer = _build_optimizer(model, tcfg, scheduler)
     pool_ema = jnp.zeros(cfg.N)
 
     _print_param_table(model)
@@ -1255,9 +1262,11 @@ def train(run_cfg: RunConfig) -> None:
             _ss_time  += win_secs
             _win_min   = min(_win_min, win_secs)
         val_str = f"  val={_last_val_loss:.4f}" if _last_val_loss is not None else ""
+        lr_scale = scheduler.get_lr_scale(start_step)
         print(
             f"[DWA] step={steps_done:6d}/{tcfg.total_steps} "
             f"phase={phase:8s} λ={scheduler.get_lambda(start_step):.2f} "
+            f"lr={lr_scale:.3f} "
             f"loss={mean_loss:.4f}{val_str} "
             f"win={win_secs:.1f}s  steps/s={win_steps_per_sec:.1f}  "
             f"tok/s={win_tok_per_sec:,}  TFLOP/s={achieved_tflops:.1f}"
