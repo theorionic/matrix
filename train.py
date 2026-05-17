@@ -980,15 +980,15 @@ def _probe_pallas(cfg: DWAConfig, mesh: Mesh) -> bool:
         B_probe = n_dev  # one item per device
         gathered = jax.device_put(
             jnp.zeros((B_probe, cfg.k_max, cfg.D)),
-            NamedSharding(mesh, P("batch", None, None)),
+            NamedSharding(mesh, P("data", None, None)),
         )
         alphas = jax.device_put(
             jnp.ones((B_probe, cfg.k_max)) / cfg.k_max,
-            NamedSharding(mesh, P("batch", None)),
+            NamedSharding(mesh, P("data", None)),
         )
         h_A = jax.device_put(
             jnp.zeros((B_probe, cfg.seq_len, cfg.d_A)),
-            NamedSharding(mesh, P("batch", None, None)),
+            NamedSharding(mesh, P("data", None, None)),
         )
         W_base = jnp.zeros((cfg.d_B, cfg.d_A))
         b_base = jnp.zeros(cfg.d_B)
@@ -1161,12 +1161,15 @@ def train(run_cfg: RunConfig) -> None:
             batch_size=tcfg.batch_size,
         )
 
-    # Pallas + shard_map is verified correct but hits a TPU VMEM constraint
-    # when compiled inside jax.lax.scan + value_and_grad (the scan backward
-    # JVP context has a 16MB scoped VMEM limit that the kernel exceeds).
-    # Training uses pure-JAX; Pallas remains available for inference.
-    _use_pallas = False
-    print(f"[DWA] Pallas assembly: disabled for training (VMEM constraint in scan+vjp); available for inference")
+    # Pallas assembly uses custom_vjp: forward runs in VMEM (fused, no HBM
+    # writes for delta_W / U / V intermediates), backward is pure-JAX (no
+    # VMEM pressure in scan backward).  Probe at startup to confirm the
+    # kernel compiles on this device configuration.
+    _use_pallas = _probe_pallas(cfg, mesh)
+    if _use_pallas:
+        print(f"[DWA] Pallas assembly: ENABLED (custom_vjp fused forward, pure-JAX backward)")
+    else:
+        print(f"[DWA] Pallas assembly: disabled (probe failed — falling back to pure JAX)")
 
     # Pre-JIT train windows for each phase
     # (re-compilation happens at phase boundaries, not per step)

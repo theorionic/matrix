@@ -25,7 +25,7 @@ def shard_flash_attention(q, k, v, causal, sm_scale, mesh):
         mesh=mesh,
         in_specs=(P("data", None, None, None), P("data", None, None, None), P("data", None, None, None)),
         out_specs=P("data", None, None, None),
-        check_rep=False,
+        check_vma=False,
     )(q, k, v)
 
 

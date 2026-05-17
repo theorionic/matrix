@@ -43,7 +43,7 @@ def _distributed_gather(pool_vecs, indices, mesh):
         mesh=mesh,
         in_specs=(P("model", None), P("data", None)),
         out_specs=P("data", None, None),
-        check_rep=False,
+        check_vma=False,
     )(pool_vecs, indices)
 
 
@@ -104,7 +104,7 @@ def _vocab_parallel_cross_entropy(
         body, mesh=mesh,
         in_specs=(_P("data", None, None), _P(None, "model"), _P("data", None)),
         out_specs=_P(),
-        check_rep=False,
+        check_vma=False,
     )(h_out, kernel, targets)
 
 

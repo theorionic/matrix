@@ -22,9 +22,9 @@ model:
   seq_len: 256
   gamma_init: 0.1
   bf16_pool: true
-  compute_dtype: float32
+  compute_dtype: bfloat16
   remat: false
-  use_flash_attn: false
+  use_flash_attn: true
   vocab_parallel: true
 train:
   warmup_steps: 200
@@ -42,7 +42,7 @@ train:
   lr_retrieval: 0.0001
   lr_threshold: 0.001
   lr_min_scale: 1.0
-  batch_size: 128
+  batch_size: 256
   steps_per_window: 32
   seed: 42
   lr_warmup_steps: 500
