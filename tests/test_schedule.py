@@ -105,3 +105,30 @@ class TestLRSchedule:
         v1 = float(jax.jit(lambda c: schedule_fn(c))(jnp.array(tcfg.total_steps - 1)))
         v2 = float(jax.jit(lambda c: schedule_fn(c))(jnp.array(tcfg.total_steps + 1000)))
         assert v1 == pytest.approx(v2, rel=1e-4)
+
+
+class TestGateMix:
+    def test_gate_mix_zero_during_warmup(self, sched, tcfg):
+        for step in [0, tcfg.warmup_steps // 2, tcfg.warmup_steps - 1]:
+            assert sched.gate_mix(step) == 0.0
+
+    def test_gate_mix_ramps_after_warmup(self, sched, tcfg):
+        ramp = tcfg.gate_ramp_steps
+        start = tcfg.warmup_steps
+        assert sched.gate_mix(start) == 0.0
+        assert sched.gate_mix(start + ramp) == 1.0
+        mid = sched.gate_mix(start + ramp // 2)
+        assert 0.4 < mid < 0.6
+
+    def test_gate_mix_one_after_ramp(self, sched, tcfg):
+        after_ramp = tcfg.warmup_steps + tcfg.gate_ramp_steps + 1
+        assert sched.gate_mix(after_ramp) == 1.0
+        assert sched.gate_mix(tcfg.total_steps) == 1.0
+
+    def test_gate_mix_zero_ramp_instant(self, tcfg):
+        t = TrainConfig()
+        t.gate_ramp_steps = 0
+        t.warmup_steps = 100
+        s = PhaseScheduler(t)
+        assert s.gate_mix(99) == 0.0
+        assert s.gate_mix(100) == 1.0

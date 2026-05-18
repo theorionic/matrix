@@ -96,6 +96,7 @@ class TestAuxLosses:
         r = aux_losses(*inputs, cfg, tcfg)
         expected = (
             tcfg.lambda_util * r["l_util"]
+            + tcfg.lambda_reuse * r["l_reuse"]
             + tcfg.lambda_div * r["l_div"]
             + tcfg.lambda_norm * r["l_norm"]
             + tcfg.lambda_sparse * r["l_sparse"]

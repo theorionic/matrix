@@ -176,12 +176,15 @@ class TrainConfig:
     lambda_gate_start: float = 1.0
     lambda_gate_end: float = 5.0
     lambda_sharpen_end: float = 10.0
+    gate_ramp_steps: int = 200     # blend warmup→gate over this many steps
 
     # Auxiliary loss weights
     lambda_util: float = 0.01
+    lambda_reuse: float = 0.01
     lambda_div: float = 0.01
     lambda_norm: float = 0.001
     lambda_sparse: float = 0.001
+    lambda_z: float = 0.001             # z-loss: penalize (log Σ exp(s_i/T))²
 
     # Per-component learning rates
     lr_pool: float = 3e-5

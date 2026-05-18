@@ -140,6 +140,7 @@ class DWAModel(nnx.Module):
         use_pallas: bool = True,          # use Pallas assembly kernel
         mesh=None,                        # jax.sharding.Mesh for shard_map Pallas
         compute_logits: bool = True,      # False when vocab_parallel handles the lm head
+        gate_mix: float = 1.0,           # 0.0=pure warmup, 1.0=pure gate
     ) -> tuple[jnp.ndarray | None, dict]:
         """
         Returns:
@@ -177,7 +178,9 @@ class DWAModel(nnx.Module):
             pool_keys = key_cache                  # [S, N, d_k] — free
 
         # Retrieval — mesh enables model-axis all-gather inside retrieval
-        alphas, indices, soft_full = self.retrieval(z, pool_keys, lambda_val, is_warmup, mesh=mesh)
+        alphas, indices, soft_full, l_z = self.retrieval(
+            z, pool_keys, lambda_val, is_warmup, gate_mix=gate_mix, mesh=mesh
+        )
 
         # Gather pool vectors [B, k_max, D]; uses distributed gather when pool is
         # model-sharded so we never all-gather the full 4 GB pool across devices.
@@ -236,6 +239,7 @@ class DWAModel(nnx.Module):
             "alphas": alphas,
             "indices": indices,
             "soft_full": soft_full,
+            "l_z": l_z,
             "W": W,
             "pool_keys": pool_keys_full,
             "W_base": W_base,
@@ -264,6 +268,7 @@ def forward_and_loss(
     key_cache: jnp.ndarray | None = None,
     use_pallas: bool = True,
     mesh=None,
+    gate_mix: float = 1.0,
 ) -> tuple[jnp.ndarray, dict]:
     """Combined forward + loss for use with nnx.value_and_grad."""
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -274,11 +279,10 @@ def forward_and_loss(
     logits, metrics = model(
         input_ids, lambda_val, is_warmup, key_cache, use_pallas, mesh,
         compute_logits=not use_vp,
+        gate_mix=gate_mix,
     )
 
     if use_vp:
-        # Shard lm_head kernel across model axis so each device holds [d_B, V/n_model].
-        # Avoids materialising the full [B, T, V] logits tensor (saves ~4-8 GB/device).
         kernel = jax.lax.with_sharding_constraint(
             model.lm_head.kernel[...],
             NamedSharding(mesh, P(None, "model")),
@@ -288,6 +292,12 @@ def forward_and_loss(
         )
     else:
         l_task = task_loss(logits, input_ids)
+
+    # Z-loss: penalize the log-partition-function² to prevent score explosion
+    # during gate_on.  When scores grow large, softmax concentrates on one vector,
+    # starving all others — this is the collapse mechanism.  Penalizing
+    # (log Σ exp(s_i/T))² keeps scores from growing, maintaining soft diversity.
+    l_z = metrics.get("l_z", jnp.zeros(()))
 
     if aux_on:
         aux = aux_losses(
@@ -300,11 +310,21 @@ def forward_and_loss(
             model.cfg,
             tcfg,
         )
-        total_loss = l_task + aux["total_aux"]
+        total_loss = l_task + aux["total_aux"] + tcfg.lambda_z * l_z
     else:
-        aux = {k: jnp.zeros(()) for k in ("l_util", "l_div", "l_norm", "l_sparse", "total_aux")}
-        total_loss = l_task
+        # Warmup phase: apply L_util + L_reuse to prevent pool collapse.
+        # L_util penalizes heavy hitters; L_reuse gives gradient to dead vectors.
+        flat_idx = metrics["indices"].reshape(-1)           # [B*k]
+        N        = model.cfg.N
+        f        = jnp.zeros(N).at[flat_idx].add(1.0) / flat_idx.shape[0]
+        P        = metrics["soft_full"].mean(axis=0)
+        l_util   = N * jnp.dot(f, P)
+        l_reuse  = -jnp.log(P + 1e-8).mean()
+        aux = {k: jnp.zeros(()) for k in ("l_div", "l_norm", "l_sparse", "total_aux")}
+        aux["l_util"] = l_util
+        aux["l_reuse"] = l_reuse
+        total_loss = l_task + tcfg.lambda_util * l_util + tcfg.lambda_reuse * l_reuse + tcfg.lambda_z * l_z
 
-    info = {**aux, "l_task": l_task, "loss": total_loss,
+    info = {**aux, "l_task": l_task, "l_z": l_z, "loss": total_loss,
             "alphas": metrics["alphas"], "indices": metrics["indices"]}
     return total_loss, info

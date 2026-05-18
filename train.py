@@ -16,6 +16,16 @@ Run:
 
 from __future__ import annotations
 
+import os
+
+# XLA persistent compilation cache — avoids recompiling across runs.
+# Must be set before any JAX import.  Falls back gracefully if the flag
+# isn't recognized by this JAX version.
+_CACHE_DIR = os.environ.get("JAX_COMPILATION_CACHE_DIR",
+                             os.path.join(os.path.dirname(__file__), ".jax_cache"))
+os.environ["JAX_COMPILATION_CACHE_DIR"] = _CACHE_DIR
+os.makedirs(_CACHE_DIR, exist_ok=True)
+
 import numpy as np
 
 # Patch JAX config BEFORE any other import (fixes optax/JAX version mismatch)
@@ -32,6 +42,9 @@ def _safe_update(name: str, val) -> None:
 
 
 _jax_cfg.config.update = _safe_update
+
+# Enable XLA persistent cache (set before other JAX imports)
+_jax_cfg.config.update("jax_compilation_cache_dir", _CACHE_DIR)
 
 import argparse
 import functools
@@ -86,7 +99,7 @@ def _build_tx(model: DWAModel, tcfg: TrainConfig,
             return "pool"
         if "tau" in p or "gamma" in p:
             return "threshold"
-        if "W_Q" in p or "aspect_weights" in p:
+        if "W_Q" in p or "W_input" in p or "aspect_weights" in p:
             return "retrieval"
         return "parts"
 
@@ -224,7 +237,7 @@ def compute_step_flops(cfg: DWAConfig, tcfg: TrainConfig) -> int:
 # ---------------------------------------------------------------------------
 
 def _make_train_window(cfg: DWAConfig, tcfg: TrainConfig, is_warmup: bool, aux_on: bool,
-                       use_pallas: bool = True, mesh=None):
+                       use_pallas: bool = True, mesh=None, gate_mix: float = 1.0):
     """
     Returns a compiled function that runs steps_per_window training steps
     inside a single jax.lax.scan call.
@@ -263,6 +276,7 @@ def _make_train_window(cfg: DWAConfig, tcfg: TrainConfig, is_warmup: bool, aux_o
                 return forward_and_loss(
                     m, batch, lam, is_warmup, tcfg, aux_on,
                     key_cache=key_cache, use_pallas=use_pallas, mesh=mesh,
+                    gate_mix=gate_mix,
                 )
 
             (loss, info), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
@@ -310,12 +324,15 @@ def _make_train_window(cfg: DWAConfig, tcfg: TrainConfig, is_warmup: bool, aux_o
         )
 
         # ── EMA centroid update ───────────────────────────────────────────────
-        # Recompute pool keys after optimizer updates pool.vectors, then set
-        # each centroid = EMA(mean of its cluster partition's key vectors).
-        # Centroids are CentroidEMA (not Param) so the optimizer never touches
-        # them — they track actual pool key space, eliminating the routing
-        # feedback loop that causes pool collapse.
-        if cfg.use_ivf:
+        # Only update when IVF is actually in use (model-sharded pools disable
+        # IVF because each device has N_local keys, so centroid update with
+        # positional partitions would corrupt centroids with partial data).
+        model_sharded = (
+            mesh is not None
+            and "model" in mesh.axis_names
+            and mesh.shape["model"] > 1
+        )
+        if cfg.use_ivf and not model_sharded:
             key_cache_new = compute_key_cache(
                 model.pool.vectors[...].astype(jnp.float32),
                 model.pool.key_proj[...].astype(jnp.float32),
@@ -364,19 +381,11 @@ def _synthetic_window(
 
 class TinyStoriesLoader:
     """
-    Bulk HuggingFace dataset loader with background prefetching.
+    Streaming HuggingFace dataset loader with background prefetching.
 
-    Fetches FETCH_SIZE rows via ds.select() and batch-tokenizes them in a
-    background thread while training runs.  By the time the current buffer
-    drains (~8s at medium config), the next chunk is already ready — so
-    get_window() never blocks on tokenization after the first fill.
-
-    Timeline:
-        t=0s  first fill completes (blocking), prefetch thread starts
-        t=0s  training begins, consuming ~4k seqs/window at 0.8s/window
-        t=4s  prefetch thread finishes tokenizing next 50k rows
-        t=8s  buffer exhausted → _refill() swaps in the pre-built buffer (instant)
-                                  and starts the next background prefetch
+    Fetches FETCH_SIZE rows at a time via ds.iter(batch_size=FETCH_SIZE) —
+    no full dataset download.  Tokenizes in a background thread while training
+    runs so get_window() never blocks after the first fill.
     """
 
     FETCH_SIZE = 50_000  # rows per bulk fetch
@@ -391,33 +400,34 @@ class TinyStoriesLoader:
         self.text_column = text_column
         self.eos         = tokenizer.eos_token_id or 0
 
-        self.ds     = load_dataset(hf_path, split="train")
-        self.n_rows = len(self.ds)
-        self._cursor  = 0
-        self._buf     = np.empty((0, seq_len), dtype=np.int32)
-        self._buf_pos = 0
+        self.ds          = load_dataset(hf_path, split="train", streaming=True)
+        self._batch_iter = self.ds.iter(batch_size=self.FETCH_SIZE)
+        self._buf        = np.empty((0, seq_len), dtype=np.int32)
+        self._buf_pos    = 0
 
         # Prefetch state — written by worker thread, read by main thread
-        self._pf_buf:    np.ndarray | None = None
-        self._pf_cursor: int               = 0
-        self._pf_event   = threading.Event()
+        self._pf_buf:  np.ndarray | None = None
+        self._pf_event = threading.Event()
 
-        print(f"[DWA] HF loader: {hf_path!r}  rows={self.n_rows:,}  "
+        print(f"[DWA] HF loader (streaming): {hf_path!r}  "
               f"col={text_column!r}  seq_len={seq_len}  fetch={self.FETCH_SIZE:,}")
 
         # First blocking fill so training can start immediately
-        packed, self._cursor = self._fetch_and_pack(self._cursor)
-        self._buf = packed
-        print(f"[DWA] Loader ready: {len(self._buf)} seqs  cursor={self._cursor:,}/{self.n_rows:,}")
+        self._buf = self._fetch_and_pack()
+        print(f"[DWA] Loader ready: {len(self._buf)} seqs")
 
         # Kick off prefetch for the second chunk right away
         self._start_prefetch()
 
-    def _fetch_and_pack(self, cursor: int):
-        """Fetch FETCH_SIZE rows; return (packed [N, seq_len], new_cursor)."""
-        end   = min(cursor + self.FETCH_SIZE, self.n_rows)
-        texts = list(self.ds.select(range(cursor, end))[self.text_column])
-        new_cursor = end % self.n_rows
+    def _fetch_and_pack(self) -> np.ndarray:
+        """Fetch FETCH_SIZE rows via streaming; return packed [N, seq_len]."""
+        try:
+            batch = next(self._batch_iter)
+        except StopIteration:
+            self._batch_iter = self.ds.iter(batch_size=self.FETCH_SIZE)
+            batch = next(self._batch_iter)
+
+        texts = batch[self.text_column]  # already a list of FETCH_SIZE strings
 
         ids_list = self.tokenizer(
             texts, add_special_tokens=False,
@@ -425,30 +435,25 @@ class TinyStoriesLoader:
         )["input_ids"]
 
         # Wrap each story: <|endoftext|> story tokens <|endoftext|>
-        # The leading token marks the start of a new document; the trailing
-        # token marks its end.  Both use the same ID in GPT-2 (50256).
         total = sum(len(s) + 2 for s in ids_list)  # +2: BOS + EOS per story
         flat  = np.empty(total, dtype=np.int32)
         pos   = 0
         for ids in ids_list:
             n = len(ids)
-            flat[pos]               = self.eos        # BOS  <|endoftext|>
-            flat[pos + 1 : pos + 1 + n] = ids        # story tokens
-            flat[pos + 1 + n]       = self.eos        # EOS  <|endoftext|>
+            flat[pos]               = self.eos
+            flat[pos + 1 : pos + 1 + n] = ids
+            flat[pos + 1 + n]       = self.eos
             pos += n + 2
 
         n_seqs = pos // self.seq_len
-        return flat[: n_seqs * self.seq_len].reshape(n_seqs, self.seq_len), new_cursor
+        return flat[: n_seqs * self.seq_len].reshape(n_seqs, self.seq_len)
 
     def _start_prefetch(self) -> None:
         """Launch a daemon thread to prepare the next chunk in the background."""
-        cursor = self._cursor
         self._pf_event.clear()
 
         def _worker():
-            packed, new_cursor = self._fetch_and_pack(cursor)
-            self._pf_buf    = packed
-            self._pf_cursor = new_cursor
+            self._pf_buf = self._fetch_and_pack()
             self._pf_event.set()
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -459,10 +464,9 @@ class TinyStoriesLoader:
 
         leftover      = self._buf[self._buf_pos :]
         new_seqs      = self._pf_buf
-        self._cursor  = self._pf_cursor
         self._buf     = np.concatenate([leftover, new_seqs], axis=0) if len(leftover) else new_seqs
         self._buf_pos = 0
-        print(f"[DWA] Loader: buf={len(self._buf)} seqs  cursor={self._cursor:,}/{self.n_rows:,}")
+        print(f"[DWA] Loader: buf={len(self._buf)} seqs")
 
         # Start the next prefetch immediately while training continues
         self._start_prefetch()
@@ -476,12 +480,11 @@ class TinyStoriesLoader:
         return out.reshape(steps, batch_size, self.seq_len)
 
     def state_dict(self) -> dict:
-        return {"cursor": self._cursor, "buf": self._buf[self._buf_pos :]}
+        return {"buf": self._buf[self._buf_pos :]}
 
     def load_state_dict(self, state: dict) -> None:
         # Wait for any in-flight prefetch to finish before overwriting state
         self._pf_event.wait()
-        self._cursor = int(state["cursor"])
         buf_data = state.get("buf")
         if buf_data is not None and len(buf_data):
             arr = np.asarray(buf_data, dtype=np.int32)
@@ -493,7 +496,7 @@ class TinyStoriesLoader:
         else:
             self._buf = np.empty((0, self.seq_len), dtype=np.int32)
         self._buf_pos = 0
-        print(f"[DWA] Loader restored at row {self._cursor:,} ({len(self._buf)} seqs buffered)")
+        print(f"[DWA] Loader restored ({len(self._buf)} seqs buffered; streaming position not preserved)")
         self._start_prefetch()
 
 
@@ -512,9 +515,10 @@ class _ValCache:
     def __init__(self, tokenizer, seq_len: int, hf_path: str, text_column: str,
                  val_batches: int, batch_size: int):
         from datasets import load_dataset
-        ds   = load_dataset(hf_path, split="validation")
-        eos  = tokenizer.eos_token_id or 0
-        texts = list(ds[text_column])
+        ds    = load_dataset(hf_path, split="validation", streaming=True)
+        eos   = tokenizer.eos_token_id or 0
+        batch = next(iter(ds.iter(batch_size=100_000)))
+        texts = batch[text_column]
 
         ids_list = tokenizer(
             texts, add_special_tokens=False,
@@ -531,10 +535,14 @@ class _ValCache:
             flat[pos + 1 + n]       = eos              # EOS  <|endoftext|>
             pos += n + 2
 
+        available_seqs = pos // seq_len
+        available_batches = available_seqs // batch_size
+        if available_batches < val_batches:
+            print(f"[DWA] Val cache: only {available_seqs} seqs available, clamping val_batches {val_batches}→{available_batches}")
+            val_batches = available_batches
+        if val_batches == 0:
+            raise ValueError(f"Val split too small: only {available_seqs} seqs, need at least {batch_size} for one batch")
         needed = val_batches * batch_size
-        assert pos // seq_len >= needed, (
-            f"Val split too small: only {pos // seq_len} seqs but need {needed}"
-        )
         self.data = flat[: needed * seq_len].reshape(val_batches, batch_size, seq_len)
         self.val_batches = val_batches
         self.batch_size  = batch_size
@@ -763,9 +771,13 @@ def _revive_dead_vectors(
 ) -> int:
     """Replace pool vectors that have near-zero EMA usage.
 
-    Dead vectors are re-seeded as perturbed copies of high-usage vectors so
-    they start with meaningful geometry rather than drifting randomly.
-    The existing sharding of model.pool.vectors is preserved.
+    Revival strategy: copy donor vectors + noise scaled so the regenerated
+    keys separate from the donor in d_k-dimensional key space (not D-dim
+    vector space). With D >> d_k, noise in vector space barely moves the
+    projected key, so the revived vector still matches the same queries as
+    its donor and dies again. Scaling noise by 1/sqrt(d_k) instead of
+    1/sqrt(D) ensures the key-space perturbation is significant enough
+    for IVF to route different queries to the revived vector.
 
     Returns the number of vectors revived.
     """
@@ -782,14 +794,16 @@ def _revive_dead_vectors(
         return 0
 
     dead_idx = np.where(dead_mask)[0]
-    pool_np  = np.array(model.pool.vectors[...], dtype=np.float32)  # gather to host
+    pool_np  = np.array(model.pool.vectors[...], dtype=np.float32)
     rng      = np.random.default_rng(step)
 
     chosen_donors = rng.choice(donor_idx, size=n_dead, replace=True)
-    # Noise std 0.2 × donor norm pushes revived vectors far enough from their
-    # donor that IVF routes different queries to them, breaking the feedback loop.
+    # Key-space-aware noise: scale by 1/sqrt(d_k) not 1/sqrt(D).
+    # D=8192 >> d_k=64, so vector-space noise barely moves the key projection.
+    # With this scaling, the key shifts by ~0.2 * donor_key_norm — enough for
+    # cosine similarity to differ meaningfully and route different queries.
     donor_norm = float(np.linalg.norm(pool_np[chosen_donors], axis=-1).mean()) + 1e-8
-    noise = rng.normal(0.0, 0.2 * donor_norm / (cfg.D ** 0.5),
+    noise = rng.normal(0.0, 0.2 * donor_norm / (cfg.d_k ** 0.5),
                        (n_dead, cfg.D)).astype(pool_np.dtype)
     pool_np[dead_idx] = pool_np[chosen_donors] + noise
 
@@ -851,18 +865,17 @@ def save_checkpoint(
             "pool_ema":       np.array(pool_ema, dtype=np.float32),
             "steps_done":     np.array(steps_done, dtype=np.int32),
             "rng":            np.array(rng),
-            "row_cursor": np.array(loader._cursor if loader else 0, dtype=np.int32),
         },
     }
 
     mngr.save(steps_done, args=ocp.args.StandardSave(save_item))
     mngr.wait_until_finished()
 
-    # Save loader state (cursor + remaining buffer) as a single npz
+    # Save loader state (remaining buffer) as a single npz
     if loader is not None:
         state = loader.state_dict()
         loader_path = os.path.join(ckpt_dir, str(steps_done), "loader_state.npz")
-        np.savez(loader_path, cursor=np.array(state["cursor"], dtype=np.int32), buf=state["buf"])
+        np.savez(loader_path, buf=state["buf"])
 
     print(f"[Ckpt] Saved step {steps_done} → {ckpt_dir}/{steps_done}/")
 
@@ -903,7 +916,6 @@ def load_checkpoint(
             "pool_ema":       jax.ShapeDtypeStruct((cfg.N,), np.float32),
             "steps_done":     jax.ShapeDtypeStruct((), np.int32),
             "rng":            _abstract_like(np.array(jax.random.PRNGKey(0))),
-            "row_cursor": jax.ShapeDtypeStruct((), np.int32),
         },
     }
 
@@ -949,17 +961,15 @@ def load_checkpoint(
     rng         = jnp.array(restored["meta"]["rng"])
     steps_done  = int(restored["meta"]["steps_done"])
 
-    # --- Loader state (cursor + packed buf) ---
+    # --- Loader state (packed buf) ---
     loader_path = os.path.join(ckpt_dir, str(steps_done_target), "loader_state.npz")
     if os.path.exists(loader_path):
         d = np.load(loader_path)
-        loader_state = {"cursor": int(d["cursor"]), "buf": d["buf"]}
+        loader_state = {"buf": d["buf"]}
     else:
-        # Legacy fallback: cursor in orbax meta, buf in separate buf.npy
-        row_cursor = int(restored["meta"]["row_cursor"])
-        buf_path   = os.path.join(ckpt_dir, str(steps_done_target), "buf.npy")
-        buf        = np.load(buf_path) if os.path.exists(buf_path) else np.empty((0,), dtype=np.int32)
-        loader_state = {"cursor": row_cursor, "buf": buf}
+        buf_path = os.path.join(ckpt_dir, str(steps_done_target), "buf.npy")
+        buf      = np.load(buf_path) if os.path.exists(buf_path) else np.empty((0,), dtype=np.int32)
+        loader_state = {"buf": buf}
 
     print(f"[Ckpt] Loaded step {steps_done} from {ckpt_dir}/{steps_done_target}/")
     return steps_done, rng, loader_state, pool_ema
@@ -969,15 +979,21 @@ def load_checkpoint(
 # Pallas probe — check at startup whether the kernel compiles successfully
 # ---------------------------------------------------------------------------
 
-def _probe_pallas(cfg: DWAConfig, mesh: Mesh) -> bool:
+def _probe_pallas(cfg: DWAConfig, mesh: Mesh, local_batch: int) -> bool:
     """
     Try to compile the Pallas assembly kernel via shard_map.
-    Each device sees one example; passes if kernel compiles cleanly.
+    Uses the actual per-device batch size so VMEM and Mosaic constraints
+    match what the training window will encounter.
     """
-    from src.dwa.assembly_pallas import shard_pallas_assemble
+    from src.dwa.assembly_pallas import pallas_vmem_feasible, shard_pallas_assemble
+    kr = cfg.k_max * cfg.r
+    elem_bytes = 2 if cfg.compute_dtype == jnp.bfloat16 else 4
+    if not pallas_vmem_feasible(local_batch, cfg.seq_len, cfg.d_B, kr, cfg.d_A, elem_bytes):
+        print(f"[DWA] Pallas assembly: not feasible for B_local={local_batch}, "
+              f"T={cfg.seq_len}, d={cfg.d_A}, kr={kr} (VMEM/Mosaic constraints)")
+        return False
     try:
-        n_dev = len(mesh.devices)
-        B_probe = n_dev  # one item per device
+        B_probe = len(mesh.devices)
         gathered = jax.device_put(
             jnp.zeros((B_probe, cfg.k_max, cfg.D)),
             NamedSharding(mesh, P("data", None, None)),
@@ -1165,23 +1181,26 @@ def train(run_cfg: RunConfig) -> None:
     # writes for delta_W / U / V intermediates), backward is pure-JAX (no
     # VMEM pressure in scan backward).  Probe at startup to confirm the
     # kernel compiles on this device configuration.
-    _use_pallas = _probe_pallas(cfg, mesh)
+    _use_pallas = _probe_pallas(cfg, mesh, local_batch)
     if _use_pallas:
         print(f"[DWA] Pallas assembly: ENABLED (custom_vjp fused forward, pure-JAX backward)")
     else:
         print(f"[DWA] Pallas assembly: disabled (probe failed — falling back to pure JAX)")
 
     # Pre-JIT train windows for each phase
-    # (re-compilation happens at phase boundaries, not per step)
+    # (re-compilation happens at phase boundaries or gate_mix changes)
     compiled_fns: dict[tuple, object] = {}
 
-    def get_train_fn(is_warmup: bool, aux_on: bool):
-        key = (is_warmup, aux_on)
+    def get_train_fn(is_warmup: bool, aux_on: bool, gate_mix: float):
+        # Quantize gate_mix to 0.1 steps for caching (avoids recompile per-step)
+        gm_q = round(gate_mix * 10) / 10.0
+        key = (is_warmup, aux_on, gm_q)
         if key not in compiled_fns:
             compiled_fns[key] = _make_train_window(
                 cfg, tcfg, is_warmup, aux_on,
                 use_pallas=_use_pallas,
                 mesh=mesh,
+                gate_mix=gm_q,
             )
         return compiled_fns[key]
 
@@ -1291,7 +1310,8 @@ def train(run_cfg: RunConfig) -> None:
         # Shard data: batch dim across data-parallel replicas (dim 1)
         data_sharded = jax.device_put(data_window, NamedSharding(mesh, P(None, "data", None)))
 
-        train_fn = get_train_fn(is_warmup, aux_on)
+        gate_mix = scheduler.gate_mix(start_step)
+        train_fn = get_train_fn(is_warmup, aux_on, gate_mix)
         t_win = time.time()
         model, optimizer, pool_ema, info = train_fn(
             model, optimizer, data_sharded, lam_window, pool_ema, tcfg.ema_decay,

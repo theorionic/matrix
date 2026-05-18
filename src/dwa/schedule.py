@@ -54,6 +54,20 @@ class PhaseScheduler:
     def aux_enabled(self, step: int) -> bool:
         return step >= self.cfg.warmup_steps
 
+    def gate_mix(self, step: int) -> float:
+        """Blend coefficient: 0.0 = pure warmup, 1.0 = pure gate.
+
+        Ramps linearly from 0 → 1 over gate_ramp_steps after warmup ends.
+        Before warmup: returns 0.0. After ramp: returns 1.0.
+        """
+        if step < self.cfg.warmup_steps:
+            return 0.0
+        ramp = self.cfg.gate_ramp_steps
+        if ramp <= 0:
+            return 1.0
+        t = min((step - self.cfg.warmup_steps) / ramp, 1.0)
+        return float(t)
+
     def make_lambda_array(self, total_steps: int | None = None) -> jnp.ndarray:
         """Pre-compute λ schedule as a JAX array for use inside lax.scan."""
         n = total_steps or self.cfg.total_steps

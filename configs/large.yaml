@@ -12,14 +12,14 @@ model:
   S: 4
   d_k: 64
   T: 1.0
-  n_heads: 4
+  n_heads: 2
   n_kv_heads: 1
   use_rope: true
   n_layers_A: 8
   n_layers_B: 8
   ffn_mult: 4
   vocab_size: 32000
-  seq_len: 256
+  seq_len: 2048
   gamma_init: 0.1
   bf16_pool: true
   compute_dtype: bfloat16
@@ -42,7 +42,7 @@ train:
   lr_retrieval: 0.0001
   lr_threshold: 0.001
   lr_min_scale: 1.0
-  batch_size: 256
+  batch_size: 128
   steps_per_window: 32
   seed: 42
   lr_warmup_steps: 500

@@ -97,7 +97,7 @@ class CausalSelfAttention(nnx.Module):
             out = shard_flash_attention(q, k, v, True, self.scale, mesh)
             out = out.transpose(0, 2, 1, 3).reshape(B, T, C)
         else:
-            # Fallback
+            # Fallback: standard attention — JAX auto-shards across all devices
             q, k, v = q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)
             attn = jnp.einsum("bhid,bhjd->bhij", q, k) * self.scale
             mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))

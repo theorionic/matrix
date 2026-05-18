@@ -32,15 +32,16 @@ class TestRetrievalShapes:
     def test_warmup_output_shapes(self, retrieval, cfg, pool_keys):
         B = 4
         z = _make_query(cfg, B)
-        alphas, indices, soft_full = retrieval(z, pool_keys, 1.0, True)
+        alphas, indices, soft_full, l_z = retrieval(z, pool_keys, 1.0, True)
         assert alphas.shape == (B, cfg.k_max)
         assert indices.shape == (B, cfg.k_max)
         assert soft_full.shape[0] == B
+        assert l_z.shape == ()
 
     def test_gate_output_shapes(self, retrieval, cfg, pool_keys):
         B = 4
         z = _make_query(cfg, B)
-        alphas, indices, soft_full = retrieval(z, pool_keys, 5.0, False)
+        alphas, indices, soft_full, l_z = retrieval(z, pool_keys, 5.0, False)
         assert alphas.shape == (B, cfg.k_max)
         assert indices.shape == (B, cfg.k_max)
 
@@ -48,24 +49,24 @@ class TestRetrievalShapes:
 class TestRetrievalInvariants:
     def test_alphas_sum_to_one(self, retrieval, cfg, pool_keys):
         z = _make_query(cfg)
-        alphas, _, _ = retrieval(z, pool_keys, 1.0, True)
+        alphas, _, _, _ = retrieval(z, pool_keys, 1.0, True)
         row_sums = alphas.sum(axis=-1)
         assert jnp.allclose(row_sums, jnp.ones(4), atol=1e-5)
 
     def test_alphas_non_negative(self, retrieval, cfg, pool_keys):
         z = _make_query(cfg)
-        alphas, _, _ = retrieval(z, pool_keys, 5.0, False)
+        alphas, _, _, _ = retrieval(z, pool_keys, 5.0, False)
         assert jnp.all(alphas >= 0)
 
     def test_indices_in_valid_range(self, retrieval, cfg, pool_keys):
         z = _make_query(cfg)
-        _, indices, _ = retrieval(z, pool_keys, 1.0, True)
+        _, indices, _, _ = retrieval(z, pool_keys, 1.0, True)
         assert jnp.all(indices >= 0)
         assert jnp.all(indices < cfg.N)
 
     def test_soft_full_sums_to_one(self, retrieval, cfg, pool_keys):
         z = _make_query(cfg)
-        _, _, soft_full = retrieval(z, pool_keys, 1.0, True)
+        _, _, soft_full, _ = retrieval(z, pool_keys, 1.0, True)
         row_sums = soft_full.sum(axis=-1)
         assert jnp.allclose(row_sums, jnp.ones(4), atol=1e-4)
 
@@ -76,7 +77,7 @@ class TestRetrievalGradients:
 
         def loss_fn(m):
             z = _make_query(cfg)
-            alphas, _, _ = m(z, pool_keys, 5.0, False)
+            alphas, _, _, _ = m(z, pool_keys, 5.0, False)
             return alphas.sum()
 
         grads = nnx.grad(loss_fn)(retrieval)
@@ -89,7 +90,7 @@ class TestRetrievalGradients:
 
         def loss_fn(m):
             z = _make_query(cfg)
-            alphas, _, soft_full = m(z, pool_keys, 5.0, False)
+            alphas, _, soft_full, _ = m(z, pool_keys, 5.0, False)
             return alphas.sum() + soft_full.sum()
 
         grads = nnx.grad(loss_fn)(retrieval)
@@ -101,11 +102,11 @@ class TestRetrievalJIT:
     def test_warmup_jittable(self, retrieval, cfg, pool_keys):
         z = _make_query(cfg)
         fn = nnx.jit(lambda m, z, pk: m(z, pk, 1.0, True))
-        alphas, indices, soft_full = fn(retrieval, z, pool_keys)
+        alphas, indices, soft_full, l_z = fn(retrieval, z, pool_keys)
         assert jnp.all(jnp.isfinite(alphas))
 
     def test_gate_jittable(self, retrieval, cfg, pool_keys):
         z = _make_query(cfg)
         fn = nnx.jit(lambda m, z, pk: m(z, pk, 5.0, False))
-        alphas, indices, soft_full = fn(retrieval, z, pool_keys)
+        alphas, indices, soft_full, l_z = fn(retrieval, z, pool_keys)
         assert jnp.all(jnp.isfinite(alphas))

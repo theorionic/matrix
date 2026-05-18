@@ -118,7 +118,7 @@ class TestForwardAndLoss:
         _, info = forward_and_loss(
             model, input_ids, 1.0, True, tcfg, aux_on=True, use_pallas=False
         )
-        for key in ("l_task", "alphas", "indices", "l_util", "l_div", "l_norm", "l_sparse"):
+        for key in ("l_task", "alphas", "indices", "l_util", "l_div", "l_norm", "l_sparse", "l_reuse", "l_z"):
             assert key in info, f"Missing key: {key}"
 
 

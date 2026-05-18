@@ -30,13 +30,19 @@ def aux_losses(
     # l_util = N × Σ_i f_i × P_i
     #      → 1.0 when perfectly uniform, → N when fully collapsed to 1 vector
     #
-    # Gradient w.r.t. soft_full[b,i]: N × f_i / B
-    #   • heavy hitters (high f_i) get penalised → model lowers their P_i
-    #   • via softmax normalisation this raises P_i for underused vectors
+    # Limitation: gradient ∂l_util/∂P_i = N × f_i / B — zero for dead vectors (f_i=0).
+    # l_reuse below fixes this by giving gradient to low-P vectors.
     flat_idx = indices.reshape(-1)                               # [B*k]
     f = jnp.zeros(N).at[flat_idx].add(1.0) / (B * k)           # [N], sums to 1
     P = soft_full.mean(axis=0)                                   # [N]
     l_util = N * jnp.dot(f, P)   # 1.0 = uniform, N = total collapse
+
+    # L_reuse: log-probability bonus that gives gradient to dead vectors.
+    # -mean(log P) is maximized when P is uniform (P_i = 1/N → log(1/N) = -log N).
+    # Gradient ∂(-log P_i)/∂s_i ≈ 1/P_i — huge when P_i ≈ 0 (dead vector),
+    # near-zero when P_i is large (dominant vector). This is the exact inverse
+    # of L_util which only penalizes heavy hitters but ignores dead vectors.
+    l_reuse = -jnp.log(P + 1e-8).mean()
 
     # L_div: prevent key collapse among retrieved keys
     # Gather the S-aspect keys for retrieved vectors: [B, k, S, d_k]
@@ -61,11 +67,13 @@ def aux_losses(
 
     return {
         "l_util": l_util,
+        "l_reuse": l_reuse,
         "l_div": l_div,
         "l_norm": l_norm,
         "l_sparse": l_sparse,
         "total_aux": (
             tcfg.lambda_util * l_util
+            + tcfg.lambda_reuse * l_reuse
             + tcfg.lambda_div * l_div
             + tcfg.lambda_norm * l_norm
             + tcfg.lambda_sparse * l_sparse
@@ -85,3 +93,5 @@ def task_loss(logits: jnp.ndarray, targets: jnp.ndarray) -> jnp.ndarray:
     log_probs = jax.nn.log_softmax(flat_logits, axis=-1)
     loss = -log_probs[jnp.arange(B * T), flat_targets]  # gather, no [B*T, V] one_hot
     return loss.mean()
+
+

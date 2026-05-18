@@ -33,6 +33,9 @@ class MultiAspectRetrieval(nnx.Module):
     def __init__(self, cfg: DWAConfig, rngs: nnx.Rngs) -> None:
         self.cfg = cfg
         scale = cfg.d_A ** -0.5
+        self.W_input = nnx.Param(
+            jax.random.normal(rngs.params(), (cfg.S, cfg.d_A, cfg.d_A)) * scale
+        )
         self.W_Q = nnx.Param(
             jax.random.normal(rngs.params(), (cfg.S, cfg.d_k, cfg.d_A)) * scale
         )
@@ -51,18 +54,22 @@ class MultiAspectRetrieval(nnx.Module):
         pool_keys: jnp.ndarray,   # [S, N, d_k]  (may be N_local when model-sharded)
         lambda_val: float,        # sharpness
         is_warmup: bool,          # static
+        gate_mix: float = 0.0,   # 0.0 = pure warmup, 1.0 = pure gate; linear blend
         mesh=None,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
         Returns:
             alphas:  [B, k_max]
             indices: [B, k_max]
+            soft_full: [B, N]
+            l_z:     scalar, z-loss for score magnitude stabilization
         """
         cfg = self.cfg
         B = z.shape[0]
 
-        # Aspect queries: [B, S, d_k]
-        queries = jnp.einsum("ska,ba->bsk", self.W_Q[...], z)
+        # Per-aspect input projections diversify queries across aspects
+        z_aspects = jnp.einsum("sda,ba->bsa", self.W_input[...], z)
+        queries = jnp.einsum("ska,bsa->bsk", self.W_Q[...], z_aspects)
         q_norm = queries / (jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-8)
 
         # Aspect weights (shared between IVF and full-search paths)
@@ -109,8 +116,8 @@ class MultiAspectRetrieval(nnx.Module):
             # ── Full-pool soft scores for l_util ─────────────────────────────
             # Computing soft_full only over IVF candidates means l_util gradient
             # never reaches the 93%+ of pool vectors not searched this step —
-            # the root cause of pool collapse.  We pay one extra full-pool
-            # matmul here (cheap vs. TPU headroom) so every vector gets gradient.
+            # the root cause of pool collapse.  We pay one extra full-pool matmul
+            # here (cheap vs. TPU headroom) so every vector gets gradient.
             p_norm_full = pool_keys / (
                 jnp.linalg.norm(pool_keys, axis=-1, keepdims=True) + 1e-8
             )
@@ -137,9 +144,22 @@ class MultiAspectRetrieval(nnx.Module):
             )
             soft_full = jax.nn.softmax(s_i / cfg.T, axis=-1)         # [B, N]
 
-        # ── Selection (warmup = softmax top-k; gate = sigmoid-gated) ─────────
+        # Z-loss: (log Σ exp(s_i / T))² per sample, averaged over batch.
+        # Prevents score magnitude explosion which causes softmax concentration → collapse.
+        # Use the full-pool scores for z-loss (s_i_full in IVF path, s_i otherwise).
+        s_for_z = s_i_full if use_ivf_now else s_i
+        l_z = (jax.nn.logsumexp(s_for_z / cfg.T, axis=-1) ** 2).mean()
+
+        # ── Selection ────────────────────────────────────────────────────────
+        # Three modes controlled by is_warmup and gate_mix:
+        #   is_warmup=True  → pure warmup (top-k + softmax)
+        #   gate_mix=0      → pure warmup (top-k + softmax)
+        #   gate_mix=1      → pure gate (sigmoid-gated)
+        #   0 < gate_mix < 1 → blended: indices from gate, α blended warmup/gate
+        #
         # soft_full [B, N] covers ALL pool vectors regardless of IVF path,
         # so l_util entropy gradient reaches every vector every step.
+
         def warmup_select(_):
             scores, local_idx = jax.lax.top_k(s_i, cfg.k_max)       # [B, k_max]
             global_idx = jnp.take_along_axis(candidate_indices, local_idx, axis=1)
@@ -147,13 +167,28 @@ class MultiAspectRetrieval(nnx.Module):
             return alpha, global_idx, soft_full
 
         def gate_select(_):
+            # Sigmoid gate provides soft selection; top-k on raw gated scores
+            # (no pre-normalization or exponential — those cause hard winner-take-all).
             g   = jax.nn.sigmoid(lambda_val * (s_i - self.tau[...]))
-            raw = g * jnp.exp(s_i / cfg.T)
-            raw = raw / (raw.sum(axis=-1, keepdims=True) + 1e-8)
-            top_raw, local_idx = jax.lax.top_k(raw, cfg.k_max)
+            raw = g * s_i
+            _, local_idx = jax.lax.top_k(raw, cfg.k_max)
             global_idx = jnp.take_along_axis(candidate_indices, local_idx, axis=1)
-            alpha = top_raw / (top_raw.sum(axis=-1, keepdims=True) + 1e-8)
+            winner_scores = jnp.take_along_axis(s_i, local_idx, axis=1)
+            alpha = jax.nn.softmax(winner_scores / cfg.T, axis=-1)
             return alpha, global_idx, soft_full
 
-        alphas, indices, soft_full_out = jax.lax.cond(is_warmup, warmup_select, gate_select, None)
-        return alphas, indices, soft_full_out
+        def blended_select(_):
+            wu_alpha, wu_idx, _ = warmup_select(None)
+            g_alpha, g_idx, _ = gate_select(None)
+            alpha = (1.0 - gate_mix) * wu_alpha + gate_mix * g_alpha
+            return alpha, g_idx, soft_full
+
+        if is_warmup:
+            alphas, indices, soft_full_out = warmup_select(None)
+        elif gate_mix <= 0.0:
+            alphas, indices, soft_full_out = warmup_select(None)
+        elif gate_mix >= 1.0:
+            alphas, indices, soft_full_out = gate_select(None)
+        else:
+            alphas, indices, soft_full_out = blended_select(None)
+        return alphas, indices, soft_full_out, l_z

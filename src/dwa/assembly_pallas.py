@@ -79,25 +79,60 @@ def assemble_jax(
 # Pallas assembly kernel (forward only — backward handled by custom_vjp)
 # ---------------------------------------------------------------------------
 
-_B_BLOCK = 8  # batch tile; must be divisible by 8 (Mosaic second-to-last dim rule)
+# Scoped VMEM limit on TPU v5e per Pallas kernel tile (bytes).
+# The compiler enforces ~16 MB; we target 14 MB to leave headroom.
+_VMEM_BUDGET = 14 * 1024 * 1024
+
+
+def _choose_b_block(B: int, T: int, d_B: int, kr: int, d_A: int,
+                    elem_bytes: int = 4) -> int:
+    """Pick the largest Bb ∈ {1,2,4,8} that fits VMEM for the assembly kernel.
+
+    Per-tile VMEM budget (inputs + intermediates + output):
+        Bb × [T*d_A + kr*d_A + kr*d_B + d_B*d_A + d_B
+              + T*kr + 2*T*d_B + T*d_A] × elem_bytes
+
+    For medium config (d=128, T=256, kr=192): Bb=8 → ~7 MB ✓
+    For 700m config (d=768, T=1024, kr=64):  Bb=1 → ~15.6 MB — no Bb fits.
+
+    Also enforces Mosaic alignment: Bb must equal B (full batch) or be
+    divisible by 8 (second-to-last dim rule for rank-2 block specs).
+
+    Returns 0 if no valid Bb exists (caller should fall back to pure JAX).
+    """
+    per_row = (T * d_A + kr * d_A + kr * d_B + d_B * d_A + d_B
+               + T * kr + 2 * T * d_B + T * d_A) * elem_bytes
+    for Bb in (8, 4, 2, 1):
+        if Bb > B or B % Bb != 0:
+            continue
+        if Bb != B and Bb % 8 != 0:
+            continue
+        if Bb * per_row <= _VMEM_BUDGET:
+            return Bb
+    return 0
+
+
+def pallas_vmem_feasible(B: int, T: int, d_B: int, kr: int, d_A: int,
+                         elem_bytes: int = 4) -> bool:
+    return _choose_b_block(B, T, d_B, kr, d_A, elem_bytes) > 0
 
 
 def _make_pallas_kernel(B: int, T: int, d_B: int, kr: int, d_A: int, dtype=jnp.float32):
     """Pallas assembly kernel: two batch matmuls, no Python loops.
 
     Inputs are pre-factored by the caller so all BlockSpec dimensions satisfy
-    Mosaic's alignment constraints (second-to-last div-by-8, last div-by-128):
-        V_scaled [B, kr, d_A]  — alpha-scaled V factors; kr=k*r (div by 8)
+    Mosaic's alignment constraints:
+        V_scaled [B, kr, d_A]  — alpha-scaled V factors; kr=k*r
         h_A      [B, T,  d_A]  — Part A hidden states
         U_flat   [B, kr, d_B]  — reshaped U factors
         W_base   [d_B, d_A]    — replicated base weight
         pb       [B, d_B]      — pre-computed alpha-weighted bias (b_base included)
         gamma    [1]            — residual scale (scalar reshaped to rank-1)
 
-    VMEM per B_BLOCK=8 block (medium config d=128, kr=192, T=256): ~7 MB.
+    Bb (batch tile) is auto-selected to fit the per-tile VMEM budget (~14 MB).
     dtype matches the activation dtype (float32 or bfloat16).
     """
-    Bb = min(_B_BLOCK, B)
+    Bb = _choose_b_block(B, T, d_B, kr, d_A, jnp.dtype(dtype).itemsize)
 
     def _kernel(Vs_ref, hA_ref, Uf_ref, Wb_ref, pb_ref, gm_ref, out_ref):
         Vs    = Vs_ref[...]        # [Bb, kr, d_A]
@@ -149,15 +184,22 @@ def _pallas_assemble_forward(
 ) -> jnp.ndarray:
     """Run the Pallas assembly forward kernel (returns h_mid only).
 
-    Pre-computes V_scaled and U_flat in JAX so the Pallas kernel only receives
-    aligned 3D tensors (all dims divisible by 8/128 as Mosaic requires).
+    Raises ValueError if the shape doesn't fit in VMEM with Mosaic alignment.
     """
     B, k, _ = gathered.shape
     T = h_A.shape[1]
+    kr = k * r
+
+    if not pallas_vmem_feasible(B, T, d_B, kr, d_A, jnp.dtype(h_A.dtype).itemsize):
+        raise ValueError(
+            f"Pallas VMEM infeasible: B={B}, T={T}, d_A={d_A}, d_B={d_B}, kr={kr} "
+            f"— no Bb satisfies both Mosaic alignment and 14 MB VMEM limit. "
+            f"Use assemble_jax instead."
+        )
+
     s1 = d_B * r
     s2 = s1 + r * d_A
     s3 = s2 + d_B
-    kr = k * r
 
     U     = gathered[:, :, :s1].reshape(B, k, d_B, r)
     V     = gathered[:, :, s1:s2].reshape(B, k, r, d_A)
