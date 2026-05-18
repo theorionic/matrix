@@ -768,41 +768,37 @@ def _revive_dead_vectors(
     cfg: DWAConfig,
     tcfg: TrainConfig,
     step: int,
-) -> int:
+) -> tuple[int, jnp.ndarray]:
     """Replace pool vectors that have near-zero EMA usage.
 
-    Revival strategy: copy donor vectors + noise scaled so the regenerated
-    keys separate from the donor in d_k-dimensional key space (not D-dim
-    vector space). With D >> d_k, noise in vector space barely moves the
-    projected key, so the revived vector still matches the same queries as
-    its donor and dies again. Scaling noise by 1/sqrt(d_k) instead of
-    1/sqrt(D) ensures the key-space perturbation is significant enough
-    for IVF to route different queries to the revived vector.
+    Revival strategy: copy donor vectors + small noise (factor=0.2) to keep
+    vector norms stable, then boost the revived vectors' EMA to ~1e-3 so they
+    survive ~700 steps without being selected. Without the EMA boost, revived
+    vectors stay at EMA=0 forever (only hard-selected indices update EMA) and
+    get classified as dead again at the next revival check regardless of noise.
 
-    Returns the number of vectors revived.
+    Returns (n_revived, updated_pool_ema).
     """
     ema_np = np.array(pool_ema, dtype=np.float32)
     dead_mask = ema_np < tcfg.dead_vector_threshold
     n_dead = int(dead_mask.sum())
     if n_dead == 0:
-        return 0
+        return 0, pool_ema
 
     # Donors: top-50% by EMA usage (avoids picking just-revived vectors)
     median_ema = float(np.median(ema_np[ema_np > 0])) if (ema_np > 0).any() else 0.0
     donor_idx = np.where(ema_np >= median_ema)[0]
     if len(donor_idx) == 0:
-        return 0
+        return 0, pool_ema
 
     dead_idx = np.where(dead_mask)[0]
     pool_np  = np.array(model.pool.vectors[...], dtype=np.float32)
     rng      = np.random.default_rng(step)
 
     chosen_donors = rng.choice(donor_idx, size=n_dead, replace=True)
-    # Key-space-aware noise: scale by 1/sqrt(d_k) not 1/sqrt(D).
-    # D=8192 >> d_k=64, so vector-space noise barely moves the key projection.
-    # With this scaling, the key shifts by ~0.2 * donor_key_norm — enough for
-    # cosine similarity to differ meaningfully and route different queries.
     donor_norm = float(np.linalg.norm(pool_np[chosen_donors], axis=-1).mean()) + 1e-8
+    # Factor 0.2: small enough to keep vector norms stable (avoids gradient explosion),
+    # yet large enough to perturb factors so L_reuse can route queries to revived vectors.
     noise = rng.normal(0.0, 0.2 * donor_norm / (cfg.d_k ** 0.5),
                        (n_dead, cfg.D)).astype(pool_np.dtype)
     pool_np[dead_idx] = pool_np[chosen_donors] + noise
@@ -814,7 +810,13 @@ def _revive_dead_vectors(
     if orig_sharding is not None:
         new_jax = jax.device_put(new_jax, orig_sharding)
     model.pool.vectors[...] = new_jax
-    return n_dead
+
+    # Boost EMA for revived vectors so they survive ~700 steps (1e-3 / (1-0.99) = 0.1
+    # effective selection rate) before next revival check, giving L_reuse time to
+    # route queries to them.  Without this, EMA stays at 0 (only hard-selected indices
+    # update EMA) and they die immediately at the next revival check.
+    ema_np[dead_idx] = 1e-3
+    return n_dead, jnp.array(ema_np)
 
 
 # ---------------------------------------------------------------------------
@@ -1401,7 +1403,7 @@ def train(run_cfg: RunConfig) -> None:
                   f"(entropy_slope={collapse_info['entropy_slope']:+.4f}/w  "
                   f"active_slope={collapse_info['active_slope']:+.4f}/w)")
         if "revive_now" in collapse_info["actions"]:
-            n_revived = _revive_dead_vectors(model, pool_ema, cfg, tcfg, steps_done)
+            n_revived, pool_ema = _revive_dead_vectors(model, pool_ema, cfg, tcfg, steps_done)
             print(f"[Collapse] CRITICAL: immediately revived {n_revived}/{cfg.N} vectors.")
 
         # 4b. Loss-adaptive LR controller
@@ -1426,7 +1428,7 @@ def train(run_cfg: RunConfig) -> None:
         #    ~revival_interval_steps regardless of steps_per_window alignment)
         _n_revived_this_win = 0
         if (steps_done // tcfg.revival_interval_steps) > (prev_steps // tcfg.revival_interval_steps):
-            _n_revived_this_win = _revive_dead_vectors(model, pool_ema, cfg, tcfg, steps_done)
+            _n_revived_this_win, pool_ema = _revive_dead_vectors(model, pool_ema, cfg, tcfg, steps_done)
             if _n_revived_this_win > 0:
                 print(f"[Safety] Revived {_n_revived_this_win}/{cfg.N} dead pool vectors.")
 

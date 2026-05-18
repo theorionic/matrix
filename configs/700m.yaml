@@ -1,0 +1,90 @@
+# DWA 700M — pool-dominant architecture with a large transformer backbone
+#
+# Parameter breakdown (~686M total):
+#   Pool (N×D):       65536 × 8192  = 537M  (78%) ← biggest component
+#   Parts A+B:        8+8 layers @ d=768  =  97M  (14%)
+#   Embed + LM head:  32000 × 768 × 2    =  49M  ( 7%)
+#   Key proj + other:                    =   3M  ( 1%)
+#
+# r=4 is the maximum rank for D=8192, d_A=d_B=768:
+#   needs D >= r*(d_A+d_B)+d_B = 4*1536+768 = 6912 <= 8192 ✓
+#   effective assembled rank = k_max * r = 16 * 4 = 64  (rank-64 updates to W ∈ R^{768×768})
+#
+# Sharding: n_model=2 auto-selected (pool+Adam=5.37GB → 2.68GB/device with 2-way model-parallel)
+#   → 2-way model parallel × 4-way data parallel on 8 chips
+#   → B=16 per data device,  11.5 GB HBM headroom for activations
+#
+# seq_len=1024: at d_A=768, attention is only ~30% of FLOPs (vs 84% for d_A=128, T=2048)
+#   → FFN/projection matmuls dominate → better MFU overall
+
+name: 700m
+model:
+  D: 8192
+  N: 65536
+  use_ivf: true
+  C: 256          # sqrt(N)=256 keeps IVF cluster size = N/C = 256, same as large config
+  m: 8
+  d_A: 768
+  d_B: 768
+  r: 4            # max rank for D=8192, d_A=d_B=768
+  k_max: 16
+  S: 4
+  d_k: 64
+  T: 2.0
+  n_heads: 6      # d_head = 768/6 = 128 — perfectly fills TPU MXU 128-tile
+  n_kv_heads: 1   # 6:1 GQA; kv_dim = 1*128 = 128
+  use_rope: true
+  n_layers_A: 8
+  n_layers_B: 8
+  ffn_mult: 4
+  vocab_size: 32000
+  seq_len: 1024
+  gamma_init: 0.1
+  bf16_pool: true
+  compute_dtype: bfloat16
+  remat: true
+  use_flash_attn: false
+  vocab_parallel: true
+train:
+  warmup_steps: 500
+  gate_on_steps: 5000
+  total_steps: 50000
+  lambda_gate_start: 1.0
+  lambda_gate_end: 3.0
+  lambda_sharpen_end: 10.0
+  gate_ramp_steps: 500
+  lambda_util: 1.0
+  lambda_reuse: 0.5
+  lambda_div: 0.01
+  lambda_norm: 0.00001
+  lambda_sparse: 0.0
+  lambda_z: 0.01
+  lr_pool: 1.0e-05      # lower LR for 4× larger pool
+  lr_parts: 5.0e-05     # lower for bigger transformer
+  lr_retrieval: 5.0e-05
+  lr_threshold: 5.0e-04
+  lr_min_scale: 1.0
+  batch_size: 32
+  steps_per_window: 16  # fewer steps per window; each step is ~5× more expensive
+  seed: 42
+  lr_warmup_steps: 1000
+  ema_decay: 0.99
+  grad_clip_norm: 1.0
+  nan_emergency_stop: 5
+  loss_spike_sigma: 5.0
+  dead_vector_threshold: 1.0e-06
+  revival_interval_steps: 250
+sharding:
+  n_model: 2            # explicit: 2-way model parallel (pool sharded), 4-way data parallel
+data:
+  source: tiny_stories
+  hf_path: roneneldan/TinyStories
+  hf_text_column: text
+  gen_every: 500
+  val_every: 500
+  val_batches: 16
+checkpoint:
+  dir: ''
+  every: 1000
+  resume: false
+  keep: 3
