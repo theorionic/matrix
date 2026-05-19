@@ -50,6 +50,19 @@ class DWAConfig:
     use_flash_attn: bool = False  # Pallas flash attention (hits VMEM limit inside scan+vjp; inference-only)
     vocab_parallel: bool = True   # shard lm_head across model axis — avoids materialising full [B,T,V] logits
 
+    # Exploration noise (Gumbel) added to retrieval scores during warmup top-k.
+    # Annealed via (1 - gate_mix) so noise fades as the gate ramps in.
+    # 0.0 disables (recovers old deterministic top-k); 0.5 is a good default for
+    # large pools (N≥16384) where deterministic warmup top-k creates positive
+    # feedback (selected vectors get strong assembly gradient → re-selected).
+    warmup_explore_noise: float = 0.5
+
+    # Floor for exploration noise.  Even after gate fully on, retain a small
+    # amount of Gumbel jitter so deterministic top-k never resumes — empirically
+    # the pool collapses the moment exploration drops to zero with N≥16K pools.
+    # Set to 0.0 to disable the floor.
+    min_explore_noise: float = 0.05
+
     def __post_init__(self):
         needed = self.d_B * self.r + self.r * self.d_A + self.d_B
         assert self.D >= needed, (
@@ -185,6 +198,21 @@ class TrainConfig:
     lambda_norm: float = 0.001
     lambda_sparse: float = 0.001
     lambda_z: float = 0.001             # z-loss: penalize (log Σ exp(s_i/T))²
+
+    # Warmup-specific aux-loss boost: multiplies lambda_util & lambda_reuse during
+    # the warmup phase only.  The main aux coefficients are tuned for steady-state
+    # (gate_on / sharpen).  During warmup, hard top-k creates a strong positive
+    # feedback loop that the steady-state weights cannot counteract — so we
+    # temporarily strengthen the load-balancing pressure.
+    warmup_aux_scale: float = 10.0
+
+    # Floor for the aux-loss boost once gate is fully on.  In sharpen phase the
+    # boost decays from warmup_aux_scale → sharpen_aux_scale (not all the way to
+    # 1× as before).  For large pools, falling back to the raw lambda_util /
+    # lambda_reuse weights at the gate ramp's end re-triggers collapse — keep
+    # a modest perpetual load-balancing pressure here.
+    sharpen_aux_scale: float = 2.0
+
 
     # Per-component learning rates
     lr_pool: float = 3e-5

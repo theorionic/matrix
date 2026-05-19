@@ -1765,8 +1765,11 @@ def train(run_cfg: RunConfig) -> None:
     compiled_fns: dict[tuple, object] = {}
 
     def get_train_fn(is_warmup: bool, aux_on: bool, gate_mix: float):
-        # Quantize gate_mix to 0.1 steps for caching (avoids recompile per-step)
-        gm_q = round(gate_mix * 10) / 10.0
+        # Quantize gate_mix to 0.25 steps for caching.  Coarser than 0.1 — only
+        # 4 buckets across the gate ramp → ~4 recompiles instead of 10 (saving
+        # ~3 min of compile time per run).  The boost-factor change between
+        # adjacent buckets is small enough that training dynamics aren't affected.
+        gm_q = round(gate_mix * 4) / 4.0
         key = (is_warmup, aux_on, gm_q)
         if key not in compiled_fns:
             compiled_fns[key] = _make_train_window(

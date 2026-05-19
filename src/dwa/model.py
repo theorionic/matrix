@@ -310,20 +310,51 @@ def forward_and_loss(
             model.cfg,
             tcfg,
         )
-        total_loss = l_task + aux["total_aux"] + tcfg.lambda_z * l_z
+        # Boost lambda_util / lambda_reuse during the gate ramp (gate_mix < 1)
+        # so the steady-state aux weights don't suddenly become too weak at the
+        # warmup → gate_on transition.  Boost decays linearly with gate_mix
+        # from warmup_aux_scale (at gate_mix=0) toward sharpen_aux_scale (at
+        # gate_mix=1), NOT all the way to 1×.  Falling to 1× at the gate
+        # ramp's end re-triggered collapse with large pools because the raw
+        # lambda_util / lambda_reuse weights are calibrated to keep
+        # contributions small in absolute terms — too small to counter the
+        # selection feedback loop.
+        gm   = float(gate_mix)
+        lo   = tcfg.sharpen_aux_scale
+        hi   = tcfg.warmup_aux_scale
+        boost = lo + (hi - lo) * (1.0 - gm)
+        boosted_aux = (
+            boost * tcfg.lambda_util  * aux["l_util"]
+            + boost * tcfg.lambda_reuse * aux["l_reuse"]
+            + tcfg.lambda_div    * aux["l_div"]
+            + tcfg.lambda_norm   * aux["l_norm"]
+            + tcfg.lambda_sparse * aux["l_sparse"]
+        )
+        total_loss = l_task + boosted_aux + tcfg.lambda_z * l_z
     else:
         # Warmup phase: apply L_util + L_reuse to prevent pool collapse.
         # L_util penalizes heavy hitters; L_reuse gives gradient to dead vectors.
+        # Coefficients are boosted by warmup_aux_scale here because the main
+        # aux weights are tuned for steady-state — during warmup, hard top-k
+        # creates a strong positive-feedback loop that the steady-state weights
+        # cannot counteract.  Clip P at 1e-4 (matches losses.py) so log gradient
+        # for dead vectors is bounded at ≤1e4 instead of ~1e8 with +1e-8 epsilon.
         flat_idx = metrics["indices"].reshape(-1)           # [B*k]
         N        = model.cfg.N
         f        = jnp.zeros(N).at[flat_idx].add(1.0) / flat_idx.shape[0]
         P        = metrics["soft_full"].mean(axis=0)
         l_util   = N * jnp.dot(f, P)
-        l_reuse  = -jnp.log(P + 1e-8).mean()
+        l_reuse  = -jnp.log(jnp.clip(P, 1e-4, 1.0)).mean()
+        scale    = tcfg.warmup_aux_scale
         aux = {k: jnp.zeros(()) for k in ("l_div", "l_norm", "l_sparse", "total_aux")}
         aux["l_util"] = l_util
         aux["l_reuse"] = l_reuse
-        total_loss = l_task + tcfg.lambda_util * l_util + tcfg.lambda_reuse * l_reuse + tcfg.lambda_z * l_z
+        total_loss = (
+            l_task
+            + scale * tcfg.lambda_util  * l_util
+            + scale * tcfg.lambda_reuse * l_reuse
+            + tcfg.lambda_z * l_z
+        )
 
     info = {**aux, "l_task": l_task, "l_z": l_z, "loss": total_loss,
             "alphas": metrics["alphas"], "indices": metrics["indices"]}
