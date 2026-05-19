@@ -1,0 +1,86 @@
+# Stability verification config for the training-instability fixes.
+#
+# Key instability condition: N=65536 (same as 700m) with large lambda_util/lambda_reuse
+# caused catastrophic loss explosion in 700m runs. This config uses the same N but a
+# lighter transformer (d=256, 4+4 layers, seq=256) so each window runs ~50-100x faster,
+# letting us cover 2500 steps (25 revival events) in a reasonable time.
+#
+# What this verifies:
+#   1. Revival capping: max_revival_frac=0.02 → at most 1310 vectors/event (not 40k+)
+#   2. L_reuse gradient bound: clip(P, 1e-4) → max gradient 10^4 (not 10^8)
+#   3. L_util scale: lambda_util=0.0002 keeps penalty < 10% of task_loss with N=65536
+#   4. L_norm: lambda_norm=0.0001 prevents W-drift explosion
+#
+name: verify_fix
+model:
+  D: 4096
+  N: 65536
+  use_ivf: true
+  C: 256
+  m: 8
+  d_A: 256
+  d_B: 256
+  r: 4             # D=4096 >= r*(d_A+d_B)+d_B = 4*512+256 = 2304 ✓
+  k_max: 16
+  S: 4
+  d_k: 64
+  T: 2.0
+  n_heads: 4
+  n_kv_heads: 1
+  use_rope: true
+  n_layers_A: 4
+  n_layers_B: 4
+  ffn_mult: 4
+  vocab_size: 32000
+  seq_len: 256
+  gamma_init: 0.1
+  bf16_pool: true
+  compute_dtype: bfloat16
+  remat: false
+  use_flash_attn: false
+  vocab_parallel: true
+train:
+  warmup_steps: 500
+  gate_on_steps: 5000
+  total_steps: 2500
+  lambda_gate_start: 1.0
+  lambda_gate_end: 3.0
+  lambda_sharpen_end: 10.0
+  gate_ramp_steps: 500
+  lambda_util: 0.0002    # same fix as 700m: N=65536 makes l_util scale [1,65536]
+  lambda_reuse: 0.01     # same fix as 700m: paired with clip(P,1e-4) in losses.py
+  lambda_div: 0.01
+  lambda_norm: 0.0001    # same fix as 700m: 10x stronger W-drift prevention
+  lambda_sparse: 0.0
+  lambda_z: 0.01
+  lr_pool: 1.0e-05
+  lr_parts: 5.0e-05
+  lr_retrieval: 5.0e-05
+  lr_threshold: 5.0e-04
+  lr_min_scale: 1.0
+  batch_size: 32
+  steps_per_window: 16
+  seed: 42
+  lr_warmup_steps: 500
+  ema_decay: 0.99
+  grad_clip_norm: 1.0
+  nan_emergency_stop: 5
+  loss_spike_sigma: 5.0
+  dead_vector_threshold: 1.0e-06
+  revival_interval_steps: 100   # fixed: more frequent but capped
+  max_revival_frac: 0.02        # fixed: at most 65536*0.02=1310 vectors per event
+  revival_noise_factor: 0.02    # fixed: was 0.2 (10x smaller noise)
+sharding:
+  n_model: 2                    # 2-way model × 4-way data on 8 chips
+data:
+  source: tiny_stories
+  hf_path: roneneldan/TinyStories
+  hf_text_column: text
+  gen_every: 250
+  val_every: 500
+  val_batches: 16
+checkpoint:
+  dir: ''
+  every: 0
+  resume: false
+  keep: 3

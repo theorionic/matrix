@@ -209,6 +209,8 @@ class TrainConfig:
     loss_spike_sigma: float = 5.0        # warn if loss jumps > N rolling σ
     dead_vector_threshold: float = 1e-6  # EMA below this → vector considered dead
     revival_interval_steps: int = 1000   # how often to revive dead pool vectors
+    max_revival_frac: float = 0.02       # cap: revive at most this fraction of pool per event
+    revival_noise_factor: float = 0.05   # noise std = factor * donor_norm / sqrt(d_k)
 
     lr_min_scale: float = 1.0
 

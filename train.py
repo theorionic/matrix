@@ -1192,11 +1192,17 @@ def _revive_dead_vectors(
     pool_np  = np.array(model.pool.vectors[...], dtype=np.float32)
     rng      = np.random.default_rng(step)
 
+    # Cap revivals to avoid massive simultaneous parameter perturbations.
+    # Revive the most-dead vectors first (lowest EMA → most starved of gradient).
+    max_revive = max(1, int(cfg.N * tcfg.max_revival_frac))
+    if n_dead > max_revive:
+        dead_ema = ema_np[dead_idx]
+        dead_idx = dead_idx[np.argsort(dead_ema)[:max_revive]]
+        n_dead = max_revive
+
     chosen_donors = rng.choice(donor_idx, size=n_dead, replace=True)
     donor_norm = float(np.linalg.norm(pool_np[chosen_donors], axis=-1).mean()) + 1e-8
-    # Factor 0.2: small enough to keep vector norms stable (avoids gradient explosion),
-    # yet large enough to perturb factors so L_reuse can route queries to revived vectors.
-    noise = rng.normal(0.0, 0.2 * donor_norm / (cfg.d_k ** 0.5),
+    noise = rng.normal(0.0, tcfg.revival_noise_factor * donor_norm / (cfg.d_k ** 0.5),
                        (n_dead, cfg.D)).astype(pool_np.dtype)
     pool_np[dead_idx] = pool_np[chosen_donors] + noise
 

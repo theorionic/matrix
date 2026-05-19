@@ -42,7 +42,10 @@ def aux_losses(
     # Gradient ∂(-log P_i)/∂s_i ≈ 1/P_i — huge when P_i ≈ 0 (dead vector),
     # near-zero when P_i is large (dominant vector). This is the exact inverse
     # of L_util which only penalizes heavy hitters but ignores dead vectors.
-    l_reuse = -jnp.log(P + 1e-8).mean()
+    # Clamp P to 1e-4 before log to bound the gradient to ≤1/1e-4=10^4 per vector.
+    # The original 1e-8 epsilon gave gradients of ~10^8 for dead vectors (P≈1e-8),
+    # overwhelming grad clipping and causing training instability with large N.
+    l_reuse = -jnp.log(jnp.clip(P, 1e-4, 1.0)).mean()
 
     # L_div: prevent key collapse among retrieved keys
     # Gather the S-aspect keys for retrieved vectors: [B, k, S, d_k]
