@@ -1,17 +1,21 @@
 """
-DWA training entry point — 8-device TPU v5e data-parallel training.
+DWA training entry point — multi-host TPU training with exact preemption resume.
 
 Training strategy:
-  - Mesh(8 devices, ('batch',)) with GSPMD data parallelism
+  - Multi-host: set JAX_COORDINATOR_ADDRESS / JAX_NUM_PROCESSES / JAX_PROCESS_ID env vars
+  - Mesh(N devices, ('data','model')) with GSPMD data + model parallelism
   - nnx.jit wraps a jax.lax.scan window of `steps_per_window` steps
   - All gradient sync happens on-device inside the scan (no CPU round-trips)
   - Three-phase schedule: warmup → gate_on → sharpen
   - Per-component LRs via optax.masked chain
+  - Grain data loader: per-host sharding + exact resume after preemption
 
-Run:
+Run (single host):
     python train.py                      # small config (fast sanity check)
     python train.py --full               # full-scale config
-    python train.py --steps 50000        # custom step count
+
+Run (multi-host, launch on every host):
+    JAX_COORDINATOR_ADDRESS=host0:1234 JAX_NUM_PROCESSES=4 JAX_PROCESS_ID=<rank> python train.py ...
 """
 
 from __future__ import annotations
@@ -73,6 +77,48 @@ from src.dwa.run_config import (
 from src.dwa.monitor import LossAdaptiveLRController, PoolCollapseDetector
 from src.dwa.schedule import PhaseScheduler
 from src.dwa.utils import ema_update
+from jax.experimental.multihost_utils import host_local_array_to_global_array
+
+
+# ---------------------------------------------------------------------------
+# Distributed init + host-0-gated logging
+# ---------------------------------------------------------------------------
+
+_IS_HOST0: bool = True                # set to False on workers after _init_distributed()
+_DISTRIBUTED_INITIALIZED: bool = False
+
+
+def _init_distributed() -> tuple[int, int]:
+    """
+    Initialize JAX distributed if multi-host env vars are set.
+
+    Set these before launching on every host:
+        JAX_COORDINATOR_ADDRESS  e.g. "192.168.1.10:1234"  (host-0 IP:port)
+        JAX_NUM_PROCESSES        total number of hosts in the pod slice
+        JAX_PROCESS_ID           this host's rank (0-based)
+
+    Safe to call multiple times; no-op after first call.
+    Returns (process_index, process_count).
+    """
+    global _DISTRIBUTED_INITIALIZED
+    if not _DISTRIBUTED_INITIALIZED:
+        coord = os.environ.get("JAX_COORDINATOR_ADDRESS", "")
+        if coord:
+            n_proc  = int(os.environ.get("JAX_NUM_PROCESSES", 1))
+            proc_id = int(os.environ.get("JAX_PROCESS_ID", 0))
+            jax.distributed.initialize(
+                coordinator_address=coord,
+                num_processes=n_proc,
+                process_id=proc_id,
+            )
+        _DISTRIBUTED_INITIALIZED = True
+    return jax.process_index(), jax.process_count()
+
+
+def _log(*args, **kwargs) -> None:
+    """print() gated to host-0 only — avoids duplicate output in multi-host runs."""
+    if _IS_HOST0:
+        print(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +422,188 @@ def _synthetic_window(
 
 
 # ---------------------------------------------------------------------------
-# HuggingFace text loader — bulk select, batch tokenize, pack into sequences
+# Grain data loader — multi-host sharding + exact preemption resume
+# ---------------------------------------------------------------------------
+
+class _HFDataSource:
+    """Grain RandomAccessDataSource wrapping a HuggingFace Dataset (non-streaming)."""
+
+    def __init__(self, dataset, text_column: str):
+        self._ds  = dataset
+        self._col = text_column
+
+    def __len__(self) -> int:
+        return len(self._ds)
+
+    def __getitem__(self, idx: int) -> str:
+        return self._ds[int(idx)][self._col]
+
+
+class GrainLoader:
+    """
+    Grain-based data loader for TPU training.
+
+    Versus TinyStoriesLoader, this adds:
+    - Multi-host sharding: each process receives a non-overlapping shard of the dataset
+      via grain.ShardOptions — no duplicated data across hosts.
+    - Exact resume: grain iterator state (bytes) + remaining token buffer survive
+      preemption; restoring both gives the exact same token sequence as if training
+      had never been interrupted.
+    - Deterministic shuffling: seed + shard → reproducible order across restarts.
+
+    Requires: pip install grain-nightly  (grain >= 0.2)
+    """
+
+    FETCH_SIZE = 8_000  # stories per bulk fetch
+
+    def __init__(
+        self,
+        tokenizer,
+        seq_len: int,
+        hf_path: str = "roneneldan/TinyStories",
+        text_column: str = "text",
+        process_index: int = 0,
+        process_count: int = 1,
+        seed: int = 42,
+        worker_count: int = 4,
+    ):
+        import grain.python as grain
+        from datasets import load_dataset
+
+        self.tokenizer      = tokenizer
+        self.seq_len        = seq_len
+        self.eos            = tokenizer.eos_token_id or 0
+        self._process_index = process_index
+        self._process_count = process_count
+
+        _log(f"[Grain] Loading {hf_path!r} for indexed access (process {process_index}/{process_count})…")
+        ds = load_dataset(hf_path, split="train")
+        self._source = _HFDataSource(ds, text_column)
+        _log(f"[Grain] Dataset: {len(self._source):,} stories  "
+             f"shard {process_index}/{process_count}")
+
+        sampler = grain.IndexSampler(
+            num_records=len(self._source),
+            shard_options=grain.ShardOptions(
+                shard_index=process_index,
+                shard_count=process_count,
+                drop_remainder=True,
+            ),
+            shuffle=True,
+            num_epochs=None,   # repeat indefinitely
+            seed=seed,
+        )
+        self._loader = grain.DataLoader(
+            data_source=self._source,
+            sampler=sampler,
+            worker_count=worker_count,
+        )
+        self._it = iter(self._loader)
+
+        self._buf     = np.empty((0, seq_len), dtype=np.int32)
+        self._buf_pos = 0
+
+        self._refill()
+        _log(f"[Grain] Loader ready: {len(self._buf)} packed seqs")
+
+    def _fetch_and_pack(self) -> np.ndarray:
+        texts = []
+        for _ in range(self.FETCH_SIZE):
+            try:
+                t = next(self._it)
+            except StopIteration:
+                # grain with num_epochs=None should never stop; reset defensively
+                self._it = iter(self._loader)
+                t = next(self._it)
+            texts.append(t if isinstance(t, str) else str(t))
+
+        ids_list = self.tokenizer(
+            texts, add_special_tokens=False,
+            return_attention_mask=False, return_token_type_ids=False,
+        )["input_ids"]
+
+        total = sum(len(s) + 2 for s in ids_list)
+        flat  = np.empty(total, dtype=np.int32)
+        pos   = 0
+        for ids in ids_list:
+            n = len(ids)
+            flat[pos]           = self.eos
+            flat[pos + 1: pos + 1 + n] = ids
+            flat[pos + 1 + n]   = self.eos
+            pos += n + 2
+
+        n_seqs = pos // self.seq_len
+        return flat[: n_seqs * self.seq_len].reshape(n_seqs, self.seq_len)
+
+    def _refill(self) -> None:
+        leftover      = self._buf[self._buf_pos:]
+        new_seqs      = self._fetch_and_pack()
+        self._buf     = np.concatenate([leftover, new_seqs], axis=0) if len(leftover) else new_seqs
+        self._buf_pos = 0
+        _log(f"[Grain] Refill: buf={len(self._buf)} seqs")
+
+    def get_window(self, steps: int, batch_size: int) -> np.ndarray:
+        needed = steps * batch_size
+        while len(self._buf) - self._buf_pos < needed:
+            self._refill()
+        out           = self._buf[self._buf_pos: self._buf_pos + needed]
+        self._buf_pos += needed
+        return out.reshape(steps, batch_size, self.seq_len)
+
+    def set_state(self, state: dict) -> None:
+        """
+        Restore exact loader position from a checkpoint state dict.
+
+        state may come in two formats:
+          Orbax format:  {"grain_mngr": CheckpointManager, "step": int, "buf": array}
+          Legacy format: {"grain_bytes": bytes, "buf": array}  (older checkpoints)
+        """
+        grain_mngr = state.get("grain_mngr")
+        if grain_mngr is not None:
+            # Restore grain iterator via PyGrainCheckpointHandler (orbax-managed)
+            import grain.python as grain
+            new_it = iter(self._loader)
+            try:
+                grain_mngr.restore(
+                    state["step"],
+                    args=ocp.args.Composite(grain=grain.PyGrainCheckpointRestore(new_it)),
+                )
+                self._it = new_it
+            except Exception as e:
+                _log(f"[Grain] Warning: orbax restore failed ({e}); "
+                     f"starting from beginning of shard")
+                self._it = iter(self._loader)
+        else:
+            # Legacy bytes-based restore
+            grain_bytes = state.get("grain_bytes")
+            if grain_bytes is not None:
+                try:
+                    new_it = iter(self._loader)
+                    new_it.set_state(bytes(grain_bytes))
+                    self._it = new_it
+                except Exception as e:
+                    _log(f"[Grain] Warning: grain state restore failed ({e}); "
+                         f"starting from beginning of shard")
+                    self._it = iter(self._loader)
+            else:
+                self._it = iter(self._loader)
+
+        buf_data = state.get("buf")
+        if buf_data is not None and len(buf_data):
+            arr = np.asarray(buf_data, dtype=np.int32)
+            if arr.ndim == 2:
+                self._buf = arr
+            else:
+                n = len(arr) // self.seq_len
+                self._buf = arr[: n * self.seq_len].reshape(n, self.seq_len)
+        else:
+            self._buf = np.empty((0, self.seq_len), dtype=np.int32)
+        self._buf_pos = 0
+        _log(f"[Grain] Loader restored: {len(self._buf)} packed seqs buffered")
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace streaming loader (fallback when grain is not installed)
 # ---------------------------------------------------------------------------
 
 class TinyStoriesLoader:
@@ -409,12 +636,12 @@ class TinyStoriesLoader:
         self._pf_buf:  np.ndarray | None = None
         self._pf_event = threading.Event()
 
-        print(f"[DWA] HF loader (streaming): {hf_path!r}  "
-              f"col={text_column!r}  seq_len={seq_len}  fetch={self.FETCH_SIZE:,}")
+        _log(f"[DWA] HF loader (streaming): {hf_path!r}  "
+             f"col={text_column!r}  seq_len={seq_len}  fetch={self.FETCH_SIZE:,}")
 
         # First blocking fill so training can start immediately
         self._buf = self._fetch_and_pack()
-        print(f"[DWA] Loader ready: {len(self._buf)} seqs")
+        _log(f"[DWA] Loader ready: {len(self._buf)} seqs")
 
         # Kick off prefetch for the second chunk right away
         self._start_prefetch()
@@ -466,7 +693,7 @@ class TinyStoriesLoader:
         new_seqs      = self._pf_buf
         self._buf     = np.concatenate([leftover, new_seqs], axis=0) if len(leftover) else new_seqs
         self._buf_pos = 0
-        print(f"[DWA] Loader: buf={len(self._buf)} seqs")
+        _log(f"[DWA] Loader: buf={len(self._buf)} seqs")
 
         # Start the next prefetch immediately while training continues
         self._start_prefetch()
@@ -496,7 +723,7 @@ class TinyStoriesLoader:
         else:
             self._buf = np.empty((0, self.seq_len), dtype=np.int32)
         self._buf_pos = 0
-        print(f"[DWA] Loader restored ({len(self._buf)} seqs buffered; streaming position not preserved)")
+        _log(f"[DWA] Loader restored ({len(self._buf)} seqs buffered; streaming position not preserved)")
         self._start_prefetch()
 
 
@@ -538,7 +765,7 @@ class _ValCache:
         available_seqs = pos // seq_len
         available_batches = available_seqs // batch_size
         if available_batches < val_batches:
-            print(f"[DWA] Val cache: only {available_seqs} seqs available, clamping val_batches {val_batches}→{available_batches}")
+            _log(f"[DWA] Val cache: only {available_seqs} seqs available, clamping val_batches {val_batches}→{available_batches}")
             val_batches = available_batches
         if val_batches == 0:
             raise ValueError(f"Val split too small: only {available_seqs} seqs, need at least {batch_size} for one batch")
@@ -547,7 +774,7 @@ class _ValCache:
         self.val_batches = val_batches
         self.batch_size  = batch_size
         self.seq_len     = seq_len
-        print(f"[DWA] Val cache: {val_batches}×{batch_size}×{seq_len}  "
+        _log(f"[DWA] Val cache: {val_batches}×{batch_size}×{seq_len}  "
               f"({needed} seqs from {len(texts)} val stories)")
 
 
@@ -707,9 +934,9 @@ def _verify_learning(
     model: DWAModel, cfg: DWAConfig, tcfg: TrainConfig
 ) -> None:
     """Print pattern-learning accuracy for 3 random repeat-period test cases."""
-    print(f"\n[DWA] Learning verification (period-{PATTERN_PERIOD} repeat pattern, "
+    _log(f"\n[DWA] Learning verification (period-{PATTERN_PERIOD} repeat pattern, "
           f"vocab={cfg.vocab_size}):")
-    print(f"  Theoretical min loss ≈ "
+    _log(f"  Theoretical min loss ≈ "
           f"{PATTERN_PERIOD / cfg.seq_len * jnp.log(cfg.vocab_size).item():.3f} nats")
 
     rng = jax.random.PRNGKey(9999)
@@ -724,7 +951,7 @@ def _verify_learning(
         exp_new = (pattern * 16)[len(prefix): len(prefix) + n_gen]
         acc     = sum(g == e for g, e in zip(gen_new, exp_new)) / n_gen
         ok      = "✓" if acc >= 0.875 else "✗"
-        print(f"  [{ok}] pattern={pattern}  gen={gen_new}  exp={exp_new}  acc={acc:.0%}")
+        _log(f"  [{ok}] pattern={pattern}  gen={gen_new}  exp={exp_new}  acc={acc:.0%}")
 
 
 # ---------------------------------------------------------------------------
@@ -740,7 +967,7 @@ def _generate_text_sample(model: DWAModel, tokenizer, tcfg: TrainConfig, step: i
     out    = generate(model, ids, n_new=120, tcfg=tcfg, eos_token_id=eos)
     # Decode without the leading BOS
     text   = tokenizer.decode(out[1:], skip_special_tokens=True)
-    print(f"\n[DWA] step={step} sample: {text}\n")
+    _log(f"\n[DWA] step={step} sample: {text}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +1058,24 @@ def _get_ckpt_manager(ckpt_dir: str, keep: int = 3) -> "ocp.CheckpointManager":
     )
 
 
+def _get_grain_ckpt_manager(ckpt_dir: str, process_index: int,
+                             keep: int = 3) -> "ocp.CheckpointManager":
+    """
+    Per-host CheckpointManager for Grain iterator state.
+
+    Each host owns a different dataset shard, so grain state is host-local.
+    Stored at ckpt_dir/grain_p{pid}/ — separate from the shared JAX checkpoint.
+    """
+    import grain.python as grain
+    grain_dir = os.path.join(ckpt_dir, f"grain_p{process_index}")
+    os.makedirs(grain_dir, exist_ok=True)
+    return ocp.CheckpointManager(
+        grain_dir,
+        item_handlers={"grain": grain.PyGrainCheckpointHandler()},
+        options=ocp.CheckpointManagerOptions(max_to_keep=keep),
+    )
+
+
 def save_checkpoint(
     ckpt_dir: str,
     model: DWAModel,
@@ -838,48 +1083,68 @@ def save_checkpoint(
     pool_ema: jnp.ndarray,
     steps_done: int,
     rng: jax.Array,
-    loader: "TinyStoriesLoader | None",
+    loader,
     keep: int = 3,
+    process_index: int = 0,
 ) -> None:
     """
-    Save a full training checkpoint.
+    Save a full training checkpoint (multi-host aware).
 
-    JAX arrays (model params, opt state, pool EMA, RNG) go through orbax
-    StandardCheckpointer — which handles sharded arrays correctly.
-    The token buffer (variable-length Python list) is saved as a .npy file
-    alongside the orbax directory at ckpt_dir/{steps_done}/buf.npy.
+    JAX arrays (model, optimizer, metadata) go through the shared orbax
+    CheckpointManager — all hosts must call this; orbax coordinates internally.
+
+    GrainLoader state is split into two atomic pieces:
+      1. Grain iterator position → per-host orbax manager (grain.PyGrainCheckpointHandler)
+         at ckpt_dir/grain_p{pid}/  — saved atomically via orbax
+      2. Packed token buffer (already-fetched tokens not yet consumed) → npz alongside
+         orbax step dir at ckpt_dir/{step}/loader_buf_{pid}.npz
+
+    TinyStoriesLoader: buffer only, host-0, backward compat.
     """
     mngr = _get_ckpt_manager(ckpt_dir, keep)
 
-    # Model parameters: State pytree of numpy arrays
     model_np = jax.tree_util.tree_map(np.array, nnx.state(model, nnx.Param))
-
-    # Optimizer state: flatten to an indexed dict so we avoid optax custom types
-    # (MaskedState, etc.) that orbax cannot serialize as-is.
     opt_leaves, _ = jax.tree_util.tree_flatten(optimizer.opt_state)
     opt_dict = {f"{i:04d}": np.array(leaf) for i, leaf in enumerate(opt_leaves)}
 
     save_item = {
-        "model":          model_np,
-        "opt":            opt_dict,
+        "model": model_np,
+        "opt":   opt_dict,
         "meta": {
-            "opt_step":       np.array(int(optimizer.step[...]), dtype=np.int32),
-            "pool_ema":       np.array(pool_ema, dtype=np.float32),
-            "steps_done":     np.array(steps_done, dtype=np.int32),
-            "rng":            np.array(rng),
+            "opt_step":   np.array(int(optimizer.step[...]), dtype=np.int32),
+            "pool_ema":   np.array(pool_ema, dtype=np.float32),
+            "steps_done": np.array(steps_done, dtype=np.int32),
+            "rng":        np.array(rng),
         },
     }
 
+    # ALL hosts call this — orbax coordinates JAX array shard ownership.
     mngr.save(steps_done, args=ocp.args.StandardSave(save_item))
     mngr.wait_until_finished()
 
-    # Save loader state (remaining buffer) as a single npz
+    # Loader state — each host saves independently (different shard per host).
     if loader is not None:
-        state = loader.state_dict()
-        loader_path = os.path.join(ckpt_dir, str(steps_done), "loader_state.npz")
-        np.savez(loader_path, buf=state["buf"])
+        step_dir = os.path.join(ckpt_dir, str(steps_done))
+        os.makedirs(step_dir, exist_ok=True)
+        if isinstance(loader, GrainLoader):
+            # 1. Grain iterator position via PyGrainCheckpointHandler (atomic, orbax-managed)
+            import grain.python as grain
+            grain_mngr = _get_grain_ckpt_manager(ckpt_dir, process_index, keep)
+            grain_mngr.save(
+                steps_done,
+                args=ocp.args.Composite(grain=grain.PyGrainCheckpointSave(loader._it)),
+            )
+            grain_mngr.wait_until_finished()
+            # 2. Remaining packed token buffer (not tracked by grain — saved alongside)
+            buf_path = os.path.join(step_dir, f"loader_buf_{process_index}.npz")
+            np.savez(buf_path, buf=loader._buf[loader._buf_pos:].copy())
+        elif process_index == 0:
+            # TinyStoriesLoader: only host 0 (backward compat)
+            state = loader.state_dict()
+            loader_path = os.path.join(step_dir, "loader_state.npz")
+            np.savez(loader_path, buf=state["buf"])
 
-    print(f"[Ckpt] Saved step {steps_done} → {ckpt_dir}/{steps_done}/")
+    _log(f"[Ckpt] Saved step {steps_done} → {ckpt_dir}/{steps_done}/")
 
 
 def _abstract_like(item):
@@ -894,14 +1159,16 @@ def load_checkpoint(
     optimizer: nnx.Optimizer,
     cfg: DWAConfig,
     mesh,
+    process_index: int = 0,
 ) -> tuple[int, jax.Array, dict | None]:
     """
-    Restore model, optimizer, and metadata from a checkpoint.
+    Restore model, optimizer, and metadata from a checkpoint (multi-host aware).
 
-    Handles model-parallel sharding: pool vectors are re-sharded to
-    P('model', None) when mesh has a 'model' dimension > 1.
+    ALL hosts must call this. orbax restores each host's shard of the JAX arrays.
+    Loader state is loaded per-host (grain_state_{pid}.bin + loader_buf_{pid}.npz),
+    with fallback to the legacy loader_state.npz format.
 
-    Returns (steps_done, rng, loader_state_dict).
+    Returns (steps_done, rng, loader_state_dict, pool_ema).
     """
     mngr = _get_ckpt_manager(ckpt_dir)
 
@@ -963,17 +1230,35 @@ def load_checkpoint(
     rng         = jnp.array(restored["meta"]["rng"])
     steps_done  = int(restored["meta"]["steps_done"])
 
-    # --- Loader state (packed buf) ---
-    loader_path = os.path.join(ckpt_dir, str(steps_done_target), "loader_state.npz")
-    if os.path.exists(loader_path):
-        d = np.load(loader_path)
-        loader_state = {"buf": d["buf"]}
-    else:
-        buf_path = os.path.join(ckpt_dir, str(steps_done_target), "buf.npy")
-        buf      = np.load(buf_path) if os.path.exists(buf_path) else np.empty((0,), dtype=np.int32)
-        loader_state = {"buf": buf}
+    # --- Loader state ---
+    # Returns a dict that train() will pass to loader.set_state() or load_state_dict().
+    # For GrainLoader: {"grain_mngr": manager, "step": int, "buf": array}
+    # For TinyStoriesLoader: {"buf": array}  (legacy format)
+    step_dir = os.path.join(ckpt_dir, str(steps_done_target))
+    buf_path = os.path.join(step_dir, f"loader_buf_{process_index}.npz")
+    grain_dir = os.path.join(ckpt_dir, f"grain_p{process_index}")
 
-    print(f"[Ckpt] Loaded step {steps_done} from {ckpt_dir}/{steps_done_target}/")
+    if os.path.isdir(grain_dir) and os.path.exists(buf_path):
+        # Grain loader format: restore iterator via PyGrainCheckpointHandler
+        try:
+            import grain.python as grain  # noqa: F401
+            grain_mngr = _get_grain_ckpt_manager(ckpt_dir, process_index)
+            d = np.load(buf_path)
+            loader_state = {"grain_mngr": grain_mngr, "step": steps_done_target, "buf": d["buf"]}
+        except ImportError:
+            loader_state = {"buf": np.empty((0,), dtype=np.int32)}
+    else:
+        # Legacy TinyStoriesLoader / backward compat
+        legacy_path = os.path.join(step_dir, "loader_state.npz")
+        if os.path.exists(legacy_path):
+            d = np.load(legacy_path)
+            loader_state = {"buf": d["buf"]}
+        else:
+            buf_npy = os.path.join(step_dir, "buf.npy")
+            buf = np.load(buf_npy) if os.path.exists(buf_npy) else np.empty((0,), dtype=np.int32)
+            loader_state = {"buf": buf}
+
+    _log(f"[Ckpt] Loaded step {steps_done} from {ckpt_dir}/{steps_done_target}/")
     return steps_done, rng, loader_state, pool_ema
 
 
@@ -991,7 +1276,7 @@ def _probe_pallas(cfg: DWAConfig, mesh: Mesh, local_batch: int) -> bool:
     kr = cfg.k_max * cfg.r
     elem_bytes = 2 if cfg.compute_dtype == jnp.bfloat16 else 4
     if not pallas_vmem_feasible(local_batch, cfg.seq_len, cfg.d_B, kr, cfg.d_A, elem_bytes):
-        print(f"[DWA] Pallas assembly: not feasible for B_local={local_batch}, "
+        _log(f"[DWA] Pallas assembly: not feasible for B_local={local_batch}, "
               f"T={cfg.seq_len}, d={cfg.d_A}, kr={kr} (VMEM/Mosaic constraints)")
         return False
     try:
@@ -1019,7 +1304,7 @@ def _probe_pallas(cfg: DWAConfig, mesh: Mesh, local_batch: int) -> bool:
         jax.block_until_ready(result)
         return True
     except Exception as e:
-        print(f"[DWA] Pallas probe failed: {e}")
+        _log(f"[DWA] Pallas probe failed: {e}")
         return False
 
 
@@ -1071,19 +1356,19 @@ def _print_param_table(model: DWAModel) -> None:
     total_b = sum(mbytes.values())
     W = 24
 
-    print(f"\n[DWA] Parameter breakdown — {total_n / 1e6:.1f}M params, "
+    _log(f"\n[DWA] Parameter breakdown — {total_n / 1e6:.1f}M params, "
           f"{total_b / 1e6:.0f} MB storage (dtype-aware):")
-    print(f"  {'Component':<{W}}  {'Params':>10}  {'Storage':>10}  {'Share':>6}")
-    print(f"  {'─' * W}  {'─' * 10}  {'─' * 10}  {'─' * 6}")
+    _log(f"  {'Component':<{W}}  {'Params':>10}  {'Storage':>10}  {'Share':>6}")
+    _log(f"  {'─' * W}  {'─' * 10}  {'─' * 10}  {'─' * 6}")
     for label, _ in GROUPS:
         n, b = counts[label], mbytes[label]
         if n == 0:
             continue
-        print(f"  {label:<{W}}  {n / 1e6:>8.3f} M  {b / 1e6:>7.1f} MB  {100 * n / total_n:>5.1f}%")
+        _log(f"  {label:<{W}}  {n / 1e6:>8.3f} M  {b / 1e6:>7.1f} MB  {100 * n / total_n:>5.1f}%")
     if other_n > 0:
-        print(f"  {'(unmatched)':<{W}}  {other_n / 1e6:>8.3f} M")
-    print(f"  {'─' * W}  {'─' * 10}  {'─' * 10}  {'─' * 6}")
-    print(f"  {'TOTAL':<{W}}  {total_n / 1e6:>8.3f} M  {total_b / 1e6:>7.1f} MB  100.0%\n")
+        _log(f"  {'(unmatched)':<{W}}  {other_n / 1e6:>8.3f} M")
+    _log(f"  {'─' * W}  {'─' * 10}  {'─' * 10}  {'─' * 6}")
+    _log(f"  {'TOTAL':<{W}}  {total_n / 1e6:>8.3f} M  {total_b / 1e6:>7.1f} MB  100.0%\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1098,6 +1383,12 @@ def train(run_cfg: RunConfig) -> None:
     settings come from run_cfg.  Build one with load_config() or assemble
     it manually from DWAConfig / TrainConfig / ShardingConfig etc.
     """
+    global _IS_HOST0
+
+    # Must be called before any JAX computation; safe no-op if already initialized.
+    process_index, process_count = _init_distributed()
+    _IS_HOST0 = (process_index == 0)
+
     cfg  = run_cfg.model
     tcfg = run_cfg.train
 
@@ -1110,7 +1401,7 @@ def train(run_cfg: RunConfig) -> None:
         # Pad to the nearest multiple of 64 ≥ 50257 so vocab_parallel sharding
         # divides evenly for any n_model in {1,2,4,8}.
         cfg.vocab_size = ((tokenizer.vocab_size + 63) // 64) * 64   # 50304
-        print(f"[DWA] TinyStories mode: GPT-2 tokenizer, padded vocab_size={cfg.vocab_size}")
+        _log(f"[DWA] TinyStories mode: GPT-2 tokenizer, padded vocab_size={cfg.vocab_size}")
     elif run_cfg.data.source == "pattern":
         use_pattern = True
 
@@ -1119,6 +1410,7 @@ def train(run_cfg: RunConfig) -> None:
     ckpt_every = run_cfg.checkpoint.every
     resume     = run_cfg.checkpoint.resume
 
+    # jax.devices() returns ALL devices across all hosts after distributed init.
     devices = jax.devices()
     n_devices = len(devices)
     device_kind = devices[0].device_kind
@@ -1130,16 +1422,23 @@ def train(run_cfg: RunConfig) -> None:
 
     sharding_src = ("auto" if run_cfg.sharding.n_model == "auto"
                     else f"explicit n_model={run_cfg.sharding.n_model}")
-    print(f"[DWA] Training on {n_devices}× {device_kind}")
-    print(f"[DWA] Mesh: {n_data}×data  {n_model}×model  "
+    _log(f"[DWA] Training on {n_devices}× {device_kind}  "
+         f"({process_count} host{'s' if process_count > 1 else ''})")
+    _log(f"[DWA] Mesh: {n_data}×data  {n_model}×model  "
           f"(pool+Adam/device ≈ {cfg.N * cfg.D * 4 * 3 / n_model / 1e9:.1f} GB)"
           f"  [{sharding_src}]")
-    print(f"[DWA] Model config: N={cfg.N}, D={cfg.D}, d_A={cfg.d_A}, r={cfg.r}, "
+    _log(f"[DWA] Model config: N={cfg.N}, D={cfg.D}, d_A={cfg.d_A}, r={cfg.r}, "
           f"layers={cfg.n_layers_A}+{cfg.n_layers_B}, vocab={cfg.vocab_size}")
 
     # Per data-replica batch size
     assert tcfg.batch_size % n_data == 0, "batch_size must be divisible by n_data"
     local_batch = tcfg.batch_size // n_data
+
+    # Per-host batch: sequences this host's local devices need to supply.
+    # In multi-host mode each host provides its own slice of the global batch.
+    n_local_devices = jax.local_device_count()
+    n_data_local    = n_local_devices // n_model
+    per_host_batch  = local_batch * n_data_local   # == batch_size for single-host
 
     scheduler = PhaseScheduler(tcfg)
     lambda_array = scheduler.make_lambda_array()     # [total_steps]
@@ -1158,14 +1457,30 @@ def train(run_cfg: RunConfig) -> None:
 
     step_flops = compute_step_flops(cfg, tcfg)
     data_label = "tiny_stories" if tokenizer is not None else ("pattern" if use_pattern else "random")
-    print(f"[DWA] FLOPs/step (fwd+bwd, approx): {step_flops / 1e9:.1f}G"
+    _log(f"[DWA] FLOPs/step (fwd+bwd, approx): {step_flops / 1e9:.1f}G"
           f"  (data={data_label})")
 
-    # TinyStories streaming loader (created once; maintains iterator state across windows)
-    loader = (TinyStoriesLoader(tokenizer, cfg.seq_len,
-                                hf_path=run_cfg.data.hf_path,
-                                text_column=run_cfg.data.hf_text_column)
-              if tokenizer is not None else None)
+    # Data loader — prefer Grain (exact resume + multi-host sharding) with fallback.
+    loader = None
+    if tokenizer is not None:
+        try:
+            import grain.python  # noqa: F401 — just probe availability
+            loader = GrainLoader(
+                tokenizer, cfg.seq_len,
+                hf_path=run_cfg.data.hf_path,
+                text_column=run_cfg.data.hf_text_column,
+                process_index=process_index,
+                process_count=process_count,
+                seed=tcfg.seed,
+            )
+            _log(f"[DWA] Loader: Grain  (process {process_index}/{process_count})")
+        except ImportError:
+            loader = TinyStoriesLoader(
+                tokenizer, cfg.seq_len,
+                hf_path=run_cfg.data.hf_path,
+                text_column=run_cfg.data.hf_text_column,
+            )
+            _log("[DWA] Loader: TinyStoriesLoader (install grain-nightly for multi-host sharding)")
 
     # Validation cache — preloaded once, fixed for the entire run
     val_every  = run_cfg.data.val_every
@@ -1185,9 +1500,9 @@ def train(run_cfg: RunConfig) -> None:
     # kernel compiles on this device configuration.
     _use_pallas = _probe_pallas(cfg, mesh, local_batch)
     if _use_pallas:
-        print(f"[DWA] Pallas assembly: ENABLED (custom_vjp fused forward, pure-JAX backward)")
+        _log(f"[DWA] Pallas assembly: ENABLED (custom_vjp fused forward, pure-JAX backward)")
     else:
-        print(f"[DWA] Pallas assembly: disabled (probe failed — falling back to pure JAX)")
+        _log(f"[DWA] Pallas assembly: disabled (probe failed — falling back to pure JAX)")
 
     # Pre-JIT train windows for each phase
     # (re-compilation happens at phase boundaries or gate_mix changes)
@@ -1217,29 +1532,33 @@ def train(run_cfg: RunConfig) -> None:
         latest = mngr_probe.latest_step()
         if latest is not None:
             steps_done, rng, loader_state, pool_ema = load_checkpoint(
-                ckpt_dir, latest, model, optimizer, cfg, mesh
+                ckpt_dir, latest, model, optimizer, cfg, mesh,
+                process_index=process_index,
             )
             model.pool_ema[...] = pool_ema
             start_window = steps_done // tcfg.steps_per_window
             if loader is not None and loader_state is not None:
-                loader.load_state_dict(loader_state)
-            print(f"[Ckpt] Resuming from step {steps_done} (window {start_window}/{n_windows})")
+                if isinstance(loader, GrainLoader):
+                    loader.set_state(loader_state)
+                else:
+                    loader.load_state_dict(loader_state)
+            _log(f"[Ckpt] Resuming from step {steps_done} (window {start_window}/{n_windows})")
         else:
-            print(f"[Ckpt] No checkpoint in '{ckpt_dir}', starting fresh.")
+            _log(f"[Ckpt] No checkpoint in '{ckpt_dir}', starting fresh.")
 
-    print(f"[DWA] Training for {tcfg.total_steps} steps "
+    _log(f"[DWA] Training for {tcfg.total_steps} steps "
           f"({n_windows} windows × {tcfg.steps_per_window} steps)")
     if ckpt_dir:
-        print(f"[DWA] Checkpointing: dir='{ckpt_dir}'  every={ckpt_every} steps  keep=3")
-    print(f"[DWA] Safety: grad_clip={tcfg.grad_clip_norm}  "
+        _log(f"[DWA] Checkpointing: dir='{ckpt_dir}'  every={ckpt_every} steps  keep=3")
+    _log(f"[DWA] Safety: grad_clip={tcfg.grad_clip_norm}  "
           f"nan_stop={tcfg.nan_emergency_stop}w  "
           f"spike_sigma={tcfg.loss_spike_sigma}σ  "
           f"revival_every={tcfg.revival_interval_steps}s")
 
-    # ── Weights & Biases ─────────────────────────────────────────────────────
+    # ── Weights & Biases — host-0 only ───────────────────────────────────────
     _wb = None
     _wb_log_every = run_cfg.wandb.log_every
-    if run_cfg.wandb.enabled:
+    if run_cfg.wandb.enabled and _IS_HOST0:
         try:
             import wandb as _wandb_mod
             _wb = _wandb_mod.init(
@@ -1253,9 +1572,9 @@ def train(run_cfg: RunConfig) -> None:
                 id       = run_cfg.wandb.name     or run_cfg.name,
             )
             url_str = _wb.url or f"offline ({_wb.dir})"
-            print(f"[W&B]  Run: {url_str}")
+            _log(f"[W&B]  Run: {url_str}")
         except ImportError:
-            print("[W&B]  wandb not installed — skipping. Run: pip install wandb")
+            _log("[W&B]  wandb not installed — skipping. Run: pip install wandb")
 
     def _wlog(metrics: dict, step: int) -> None:
         if _wb is not None:
@@ -1294,23 +1613,30 @@ def train(run_cfg: RunConfig) -> None:
         # Slice lambda schedule for this window
         lam_window = lambda_array[start_step: start_step + tcfg.steps_per_window]
 
-        # Data window [steps, B, seq_len]
+        # Build this host's local data slice [steps, per_host_batch, seq_len].
+        # In multi-host mode each host independently provides its own non-overlapping
+        # shard; host_local_array_to_global_array assembles the global sharded array.
         rng, data_rng = jax.random.split(rng)
+        # Fold in process_index so synthetic data differs across hosts.
+        host_data_rng = jax.random.fold_in(data_rng, process_index)
         if loader is not None:
-            data_window = jnp.array(loader.get_window(tcfg.steps_per_window, tcfg.batch_size))
+            data_local = jnp.array(loader.get_window(tcfg.steps_per_window, per_host_batch))
         elif use_pattern:
-            data_window = _make_pattern_window(
-                data_rng, tcfg.steps_per_window, tcfg.batch_size,
+            data_local = _make_pattern_window(
+                host_data_rng, tcfg.steps_per_window, per_host_batch,
                 cfg.seq_len, cfg.vocab_size,
             )
         else:
-            data_window = _synthetic_window(
-                data_rng, tcfg.steps_per_window, tcfg.batch_size,
+            data_local = _synthetic_window(
+                host_data_rng, tcfg.steps_per_window, per_host_batch,
                 cfg.seq_len, cfg.vocab_size,
             )
 
-        # Shard data: batch dim across data-parallel replicas (dim 1)
-        data_sharded = jax.device_put(data_window, NamedSharding(mesh, P(None, "data", None)))
+        # Assemble global sharded array from per-host local slices.
+        # For single-host this is equivalent to the old jax.device_put approach.
+        data_sharded = host_local_array_to_global_array(
+            data_local, mesh, P(None, "data", None)
+        )
 
         gate_mix = scheduler.gate_mix(start_step)
         train_fn = get_train_fn(is_warmup, aux_on, gate_mix)
@@ -1345,7 +1671,7 @@ def train(run_cfg: RunConfig) -> None:
         lr_eff  = lr_base * _current_lr_scale
         lr_str  = (f"lr={lr_base:.3f}×{_current_lr_scale:.3f}={lr_eff:.4f}"
                    if abs(_current_lr_scale - 1.0) > 0.001 else f"lr={lr_base:.3f}")
-        print(
+        _log(
             f"[DWA] step={steps_done:6d}/{tcfg.total_steps} "
             f"phase={phase:8s} λ={scheduler.get_lambda(start_step):.2f} "
             f"{lr_str} "
@@ -1363,13 +1689,13 @@ def train(run_cfg: RunConfig) -> None:
         max_gnorm  = float(info["grad_norms"].max())
         if nan_count > 0:
             _consecutive_nan += 1
-            print(
+            _log(
                 f"[Safety] NaN/Inf: {nan_count}/{tcfg.steps_per_window} steps "
                 f"(grads zeroed) — consecutive bad windows: "
                 f"{_consecutive_nan}/{tcfg.nan_emergency_stop}"
             )
             if _consecutive_nan >= tcfg.nan_emergency_stop:
-                print("[Safety] EMERGENCY STOP: too many consecutive NaN windows.")
+                _log("[Safety] EMERGENCY STOP: too many consecutive NaN windows.")
                 break
         else:
             _consecutive_nan = 0
@@ -1379,7 +1705,7 @@ def train(run_cfg: RunConfig) -> None:
             mu    = float(np.mean(_loss_window))
             sigma = float(np.std(_loss_window)) + 1e-8
             if mean_loss > mu + tcfg.loss_spike_sigma * sigma:
-                print(
+                _log(
                     f"[Safety] Loss spike: {mean_loss:.4f} vs "
                     f"rolling {mu:.4f} ± {sigma:.4f} "
                     f"({(mean_loss - mu) / sigma:.1f}σ)"
@@ -1390,25 +1716,25 @@ def train(run_cfg: RunConfig) -> None:
         if window_idx % 10 == 0:
             has_bad, bad_name = _check_nan_params(model)
             if has_bad:
-                print(f"[Safety] CRITICAL: NaN/Inf in parameter '{bad_name}'. Stopping.")
+                _log(f"[Safety] CRITICAL: NaN/Inf in parameter '{bad_name}'. Stopping.")
                 break
 
         # 4. Pool-collapse detector (multi-signal, state machine)
         last_idx      = np.array(info["last_indices"])   # [B, k_max] on host
         collapse_info = collapse_detector.update(np.array(pool_ema), last_idx)
-        print(collapse_detector.format_line(collapse_info) +
+        _log(collapse_detector.format_line(collapse_info) +
               f"  gnorm={mean_gnorm:.3f}(max={max_gnorm:.3f})")
         if collapse_info["changed"]:
-            print(f"[Collapse] State → {collapse_info['state']}  "
+            _log(f"[Collapse] State → {collapse_info['state']}  "
                   f"(entropy_slope={collapse_info['entropy_slope']:+.4f}/w  "
                   f"active_slope={collapse_info['active_slope']:+.4f}/w)")
         if "revive_now" in collapse_info["actions"]:
             n_revived, pool_ema = _revive_dead_vectors(model, pool_ema, cfg, tcfg, steps_done)
-            print(f"[Collapse] CRITICAL: immediately revived {n_revived}/{cfg.N} vectors.")
+            _log(f"[Collapse] CRITICAL: immediately revived {n_revived}/{cfg.N} vectors.")
 
         # 4b. Loss-adaptive LR controller
         lr_ctrl_info = lr_ctrl.update(mean_loss, mean_gnorm)
-        print(lr_ctrl.format_line(lr_ctrl_info))
+        _log(lr_ctrl.format_line(lr_ctrl_info))
         if lr_ctrl_info["event"]:
             # Rebuild optimizer.tx with new LR scale (preserves Adam M/V moments).
             # Adam's moments are LR-independent (they track gradient statistics),
@@ -1418,7 +1744,7 @@ def train(run_cfg: RunConfig) -> None:
             _current_lr_scale = lr_ctrl_info["lr_scale"]
             optimizer.tx = _build_tx(model, tcfg, scheduler, _current_lr_scale)
             compiled_fns.clear()  # force recompile with new schedule
-            print(f"[LR]   Rebuilt optimizer schedule: ×{_current_lr_scale:.4f} "
+            _log(f"[LR]   Rebuilt optimizer schedule: ×{_current_lr_scale:.4f} "
                   f"(recompile next window)")
 
         # Text generation check every gen_every steps
@@ -1430,19 +1756,20 @@ def train(run_cfg: RunConfig) -> None:
         if (steps_done // tcfg.revival_interval_steps) > (prev_steps // tcfg.revival_interval_steps):
             _n_revived_this_win, pool_ema = _revive_dead_vectors(model, pool_ema, cfg, tcfg, steps_done)
             if _n_revived_this_win > 0:
-                print(f"[Safety] Revived {_n_revived_this_win}/{cfg.N} dead pool vectors.")
+                _log(f"[Safety] Revived {_n_revived_this_win}/{cfg.N} dead pool vectors.")
 
         # Validation loss (boundary crossing — fires every val_every steps)
         if val_cache is not None and val_every > 0 and \
                 (steps_done // val_every) > (prev_steps // val_every):
             lam_val = float(tcfg.lambda_sharpen_end)
             _last_val_loss = _compute_val_loss(model, val_cache, lam_val, mesh)
-            print(f"[Val]  step={steps_done:6d}  train={mean_loss:.4f}  val={_last_val_loss:.4f}  "
+            _log(f"[Val]  step={steps_done:6d}  train={mean_loss:.4f}  val={_last_val_loss:.4f}  "
                   f"gap={_last_val_loss - mean_loss:+.4f}")
             _wlog({"val/loss": _last_val_loss, "val/gap": _last_val_loss - mean_loss},
                   step=steps_done)
 
-        if tokenizer is not None and (steps_done // gen_every) > (prev_steps // gen_every):
+        # Text generation — host-0 only (model state is replicated so any host could do it)
+        if _IS_HOST0 and tokenizer is not None and (steps_done // gen_every) > (prev_steps // gen_every):
             _generate_text_sample(model, tokenizer, tcfg, steps_done)
 
         # ── W&B per-window log ────────────────────────────────────────────────
@@ -1484,19 +1811,23 @@ def train(run_cfg: RunConfig) -> None:
                 "perf/is_compile":      int(is_compile_win),
             }, step=steps_done)
 
-        # Checkpoint save (boundary crossing check avoids double-saves at resume)
+        # Checkpoint save — ALL hosts call this (orbax coordinates JAX array shards).
+        # Non-JAX side effects (config dump) are host-0 only.
         if ckpt_dir and ckpt_every > 0 and (steps_done // ckpt_every) > (prev_steps // ckpt_every):
-            save_checkpoint(ckpt_dir, model, optimizer, pool_ema, steps_done, rng, loader)
-            # Dump effective config once, alongside the first checkpoint
-            cfg_out = os.path.join(ckpt_dir, "effective_config.yaml")
-            if not os.path.exists(cfg_out):
-                save_config(run_cfg, cfg_out)
+            save_checkpoint(
+                ckpt_dir, model, optimizer, pool_ema, steps_done, rng, loader,
+                process_index=process_index,
+            )
+            if _IS_HOST0:
+                cfg_out = os.path.join(ckpt_dir, "effective_config.yaml")
+                if not os.path.exists(cfg_out):
+                    save_config(run_cfg, cfg_out)
 
         # Update model's pool EMA (non-trainable variable)
         model.pool_ema[...] = pool_ema
 
     elapsed_total = time.time() - t0
-    print(f"[DWA] Training complete in {elapsed_total:.1f}s")
+    _log(f"[DWA] Training complete in {elapsed_total:.1f}s")
     if _ss_time > 0:
         ss_sps    = _ss_steps / _ss_time
         ss_tflops = step_flops * ss_sps / 1e12
@@ -1504,10 +1835,10 @@ def train(run_cfg: RunConfig) -> None:
         peak = 197.0 * n_devices if "v5" in device_kind.lower() else None
         mfu  = ss_tflops / peak * 100 if peak else None
         mfu_str = (f"  MFU={mfu:.2f}% (vs {peak:.0f} TFLOP/s BF16 peak)" if peak else "")
-        print(f"[DWA] Steady-state throughput: {ss_sps:.0f} steps/s  "
+        _log(f"[DWA] Steady-state throughput: {ss_sps:.0f} steps/s  "
               f"{ss_tok:,} tok/s  {ss_tflops:.1f} TFLOP/s{mfu_str}")
         compile_secs = elapsed_total - _ss_time
-        print(f"[DWA] Time breakdown: {_ss_time:.1f}s training + {compile_secs:.1f}s XLA compilation")
+        _log(f"[DWA] Time breakdown: {_ss_time:.1f}s training + {compile_secs:.1f}s XLA compilation")
         if _wb is not None:
             _wb.summary.update({
                 "summary/ss_steps_per_sec": ss_sps,
@@ -1541,7 +1872,7 @@ def _build_run_config_from_args(args) -> RunConfig:
     # --- Base config ---
     if args.config:
         run_cfg = load_config(args.config)
-        print(f"[DWA] Loaded config from '{args.config}' (name={run_cfg.name!r})")
+        _log(f"[DWA] Loaded config from '{args.config}' (name={run_cfg.name!r})")
     else:
         # Build from preset flags (backward compat)
         if args.verify:
@@ -1599,10 +1930,10 @@ def _build_run_config_from_args(args) -> RunConfig:
         run_cfg.model.bf16_pool = True
     if args.bf16_compute or (not args.config and (args.full or args.wide)):
         run_cfg.model.compute_dtype = jnp.bfloat16
-        print("[DWA] BF16 compute enabled: linear layers will run in bfloat16")
+        _log("[DWA] BF16 compute enabled: linear layers will run in bfloat16")
     if args.remat:
         run_cfg.model.remat = True
-        print("[DWA] Gradient checkpointing enabled: ~4× less activation memory, ~33% more FLOPs")
+        _log("[DWA] Gradient checkpointing enabled: ~4× less activation memory, ~33% more FLOPs")
     if args.tiny_stories:
         run_cfg.data.source = "tiny_stories"
     if args.n_model is not None:

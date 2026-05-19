@@ -1,0 +1,12 @@
+jax==0.10.0
+jaxlib==0.10.0
+flax==0.12.7
+optax==0.2.7
+orbax-checkpoint==0.11.33
+numpy==2.4.3
+grain-nightly==0.2.16
+datasets==4.8.3
+transformers==4.57.1
+PyYAML==6.0.3
+# optional: install for experiment tracking
+# wandb
