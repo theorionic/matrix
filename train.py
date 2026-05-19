@@ -1263,6 +1263,78 @@ def load_checkpoint(
 
 
 # ---------------------------------------------------------------------------
+# Google Drive checkpoint backup via rclone
+# ---------------------------------------------------------------------------
+
+def _rclone_available() -> bool:
+    import shutil
+    return shutil.which("rclone") is not None
+
+
+def _rclone_push(local_dir: str, remote: str, remote_path: str, extra_args: str = "") -> None:
+    """
+    Sync local_dir → remote:remote_path via rclone.  Call from host-0 only.
+
+    Uses 'rclone sync' so the remote mirrors local — checkpoints pruned by
+    Orbax are also pruned on the remote.  Skips gracefully if rclone is absent.
+
+    Setup once before training:
+        apt-get install -y rclone
+        rclone config  # follow prompts to add a 'gdrive' remote
+    """
+    import subprocess
+    if not _rclone_available():
+        _log("[GDrive] rclone not found — skipping push. "
+             "Install: apt-get install -y rclone && rclone config")
+        return
+    dest = f"{remote}:{remote_path}"
+    cmd  = ["rclone", "sync", local_dir, dest, "--stats-one-line", "-v"]
+    if extra_args:
+        cmd += extra_args.split()
+    _log(f"[GDrive] Pushing {local_dir} → {dest} …")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode == 0:
+            _log("[GDrive] Push complete.")
+        else:
+            _log(f"[GDrive] Push failed (rc={result.returncode}): {result.stderr.strip()}")
+    except subprocess.TimeoutExpired:
+        _log("[GDrive] rclone push timed out (10 min).")
+
+
+def _rclone_pull(local_dir: str, remote: str, remote_path: str,
+                  process_index: int = 0, extra_args: str = "") -> None:
+    """
+    Sync remote:remote_path → local_dir via rclone.
+
+    Called by every host on preemption resume when the local checkpoint dir is
+    empty.  A small per-host stagger (process_index × 3 s) avoids hammering
+    the GDrive API from all TPU workers simultaneously.
+    """
+    import subprocess, time as _time
+    if not _rclone_available():
+        _log("[GDrive] rclone not found — skipping pull. "
+             "Install: apt-get install -y rclone && rclone config")
+        return
+    if process_index > 0:
+        _time.sleep(process_index * 3)   # stagger: 3 s per rank
+    os.makedirs(local_dir, exist_ok=True)
+    src  = f"{remote}:{remote_path}"
+    cmd  = ["rclone", "sync", src, local_dir, "--stats-one-line", "-v"]
+    if extra_args:
+        cmd += extra_args.split()
+    _log(f"[GDrive] Pulling {src} → {local_dir} …")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode == 0:
+            _log("[GDrive] Pull complete.")
+        else:
+            _log(f"[GDrive] Pull failed (rc={result.returncode}): {result.stderr.strip()}")
+    except subprocess.TimeoutExpired:
+        _log("[GDrive] rclone pull timed out (10 min).")
+
+
+# ---------------------------------------------------------------------------
 # Pallas probe — check at startup whether the kernel compiles successfully
 # ---------------------------------------------------------------------------
 
@@ -1525,6 +1597,23 @@ def train(run_cfg: RunConfig) -> None:
     steps_done = 0
     start_window = 0
     rng = jax.random.PRNGKey(tcfg.seed + 1)
+
+    # --- GDrive pull: fetch remote checkpoint when local dir has nothing ---
+    gdrive_cfg = run_cfg.gdrive
+    if (resume and ckpt_dir
+            and gdrive_cfg.enabled
+            and gdrive_cfg.pull_on_resume
+            and gdrive_cfg.remote_path):
+        mngr_early = _get_ckpt_manager(ckpt_dir)
+        if mngr_early.latest_step() is None:
+            _log("[GDrive] No local checkpoint — pulling from GDrive before resume …")
+            _rclone_pull(
+                ckpt_dir,
+                gdrive_cfg.rclone_remote,
+                gdrive_cfg.remote_path,
+                process_index=process_index,
+                extra_args=gdrive_cfg.rclone_args,
+            )
 
     # --- Resume from checkpoint ---
     if resume and ckpt_dir:
@@ -1822,6 +1911,14 @@ def train(run_cfg: RunConfig) -> None:
                 cfg_out = os.path.join(ckpt_dir, "effective_config.yaml")
                 if not os.path.exists(cfg_out):
                     save_config(run_cfg, cfg_out)
+                if (gdrive_cfg.enabled and gdrive_cfg.push_on_save
+                        and gdrive_cfg.remote_path):
+                    _rclone_push(
+                        ckpt_dir,
+                        gdrive_cfg.rclone_remote,
+                        gdrive_cfg.remote_path,
+                        extra_args=gdrive_cfg.rclone_args,
+                    )
 
         # Update model's pool EMA (non-trainable variable)
         model.pool_ema[...] = pool_ema

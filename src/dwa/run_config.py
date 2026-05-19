@@ -76,6 +76,17 @@ class WandbConfig:
 
 
 @dataclass
+class GDriveConfig:
+    """Google Drive checkpoint backup via rclone."""
+    enabled: bool = False
+    rclone_remote: str = "gdrive"     # rclone remote name (from `rclone config`)
+    remote_path: str = ""             # path on remote, e.g. "MyDrive/dwa/run_name"
+    push_on_save: bool = True         # push to GDrive after every local checkpoint save
+    pull_on_resume: bool = True       # pull from GDrive on resume if local dir is empty
+    rclone_args: str = ""             # extra rclone flags, e.g. "--transfers 8"
+
+
+@dataclass
 class RunConfig:
     """Full configuration for one training run."""
     model:      DWAConfig       = field(default_factory=DWAConfig.small)
@@ -84,6 +95,7 @@ class RunConfig:
     data:       DataConfig      = field(default_factory=DataConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     wandb:      WandbConfig     = field(default_factory=WandbConfig)
+    gdrive:     GDriveConfig    = field(default_factory=GDriveConfig)
     name: str = "dwa_run"
 
 
@@ -96,6 +108,7 @@ _TRAIN_FIELDS  = {f.name for f in dataclasses.fields(TrainConfig)}
 _DATA_FIELDS   = {f.name for f in dataclasses.fields(DataConfig)}
 _CKPT_FIELDS   = {f.name for f in dataclasses.fields(CheckpointConfig)}
 _WANDB_FIELDS  = {f.name for f in dataclasses.fields(WandbConfig)}
+_GDRIVE_FIELDS = {f.name for f in dataclasses.fields(GDriveConfig)}
 
 
 def _parse_compute_dtype(value: str | None):
@@ -200,6 +213,13 @@ def load_config(path: str) -> RunConfig:
         raise ValueError(f"Unknown wandb config keys: {unknown_w}")
     wandb_cfg = WandbConfig(**wandb_raw)
 
+    # GDrive
+    gdrive_raw = raw.get("gdrive", {})
+    unknown_g = set(gdrive_raw) - _GDRIVE_FIELDS
+    if unknown_g:
+        raise ValueError(f"Unknown gdrive config keys: {unknown_g}")
+    gdrive_cfg = GDriveConfig(**gdrive_raw)
+
     return RunConfig(
         model=model_cfg,
         train=train_cfg,
@@ -207,6 +227,7 @@ def load_config(path: str) -> RunConfig:
         data=data_cfg,
         checkpoint=ckpt_cfg,
         wandb=wandb_cfg,
+        gdrive=gdrive_cfg,
         name=raw.get("name", "dwa_run"),
     )
 
@@ -221,6 +242,7 @@ def to_dict(run_cfg: RunConfig) -> dict:
         "data": dataclasses.asdict(run_cfg.data),
         "checkpoint": dataclasses.asdict(run_cfg.checkpoint),
         "wandb": dataclasses.asdict(run_cfg.wandb),
+        "gdrive": dataclasses.asdict(run_cfg.gdrive),
     }
 
 
