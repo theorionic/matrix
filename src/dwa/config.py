@@ -214,6 +214,10 @@ class TrainConfig:
 
     lr_min_scale: float = 1.0
 
+    # Pool diversity losses
+    lambda_keyorth: float = 0.0   # off-diagonal cosine² penalty on subsampled pool keys
+    lambda_vec_div: float = 0.0   # off-diagonal cosine² penalty on subsampled pool vectors
+
     @property
     def lr_warmup(self) -> int:
         return self.lr_warmup_steps

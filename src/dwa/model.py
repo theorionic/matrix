@@ -300,6 +300,9 @@ def forward_and_loss(
     l_z = metrics.get("l_z", jnp.zeros(()))
 
     if aux_on:
+        # Only pass raw pool vectors when the vec_div loss is active — avoids
+        # pulling a 256 MB tensor into the XLA compilation graph unnecessarily.
+        _pv = model.pool.vectors[...] if tcfg.lambda_vec_div > 0.0 else None
         aux = aux_losses(
             metrics["alphas"],
             metrics["indices"],
@@ -309,6 +312,7 @@ def forward_and_loss(
             metrics["soft_full"],
             model.cfg,
             tcfg,
+            pool_vectors=_pv,
         )
         total_loss = l_task + aux["total_aux"] + tcfg.lambda_z * l_z
     else:
@@ -320,7 +324,7 @@ def forward_and_loss(
         P        = metrics["soft_full"].mean(axis=0)
         l_util   = N * jnp.dot(f, P)
         l_reuse  = -jnp.log(P + 1e-8).mean()
-        aux = {k: jnp.zeros(()) for k in ("l_div", "l_norm", "l_sparse", "total_aux")}
+        aux = {k: jnp.zeros(()) for k in ("l_div", "l_norm", "l_sparse", "l_keyorth", "l_vec_div", "total_aux")}
         aux["l_util"] = l_util
         aux["l_reuse"] = l_reuse
         total_loss = l_task + tcfg.lambda_util * l_util + tcfg.lambda_reuse * l_reuse + tcfg.lambda_z * l_z

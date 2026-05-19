@@ -1,0 +1,93 @@
+# Fix C: Aggressive cross-cluster revival.
+#
+# Problem: revival fires every 100 steps and revives at most 2% = 1310 vectors.
+# With 55k+ dead vectors, at this rate full coverage takes 55k/1310/10 = 4.2
+# revival-intervals ≈ 420 steps to fully clear. But at the same time, vectors
+# die again because the loss signals are too weak to keep them alive.
+#
+# Fix 1 (frequency): revival every 10 steps — 10× more frequent so dead vectors
+#   spend far less time starved of gradient.
+# Fix 2 (fraction): revive up to 15% = 9830 vectors per event — clears more ground.
+# Fix 3 (cross-cluster donors): revived vectors are initialised from donors in the
+#   MOST ACTIVE cluster that is DIFFERENT from the dead vector's own IVF cluster.
+#   This spreads revived vectors into query-rich regions rather than dumping them
+#   back into already-saturated cluster neighborhoods, where they lose every
+#   competition and immediately die again.
+#
+# Noise factor 0.1: slightly larger than baseline (0.02) so revived vectors
+#   are sufficiently different from their donors to start competing.
+name: fix_revival_heavy
+model:
+  D: 4096
+  N: 65536
+  use_ivf: true
+  C: 256
+  m: 8
+  d_A: 256
+  d_B: 256
+  r: 4
+  k_max: 16
+  S: 4
+  d_k: 64
+  T: 2.0
+  n_heads: 4
+  n_kv_heads: 1
+  use_rope: true
+  n_layers_A: 4
+  n_layers_B: 4
+  ffn_mult: 4
+  vocab_size: 32000
+  seq_len: 256
+  gamma_init: 0.1
+  bf16_pool: true
+  compute_dtype: bfloat16
+  remat: false
+  use_flash_attn: false
+  vocab_parallel: true
+train:
+  warmup_steps: 500
+  gate_on_steps: 5000
+  total_steps: 10000
+  lambda_gate_start: 1.0
+  lambda_gate_end: 3.0
+  lambda_sharpen_end: 10.0
+  gate_ramp_steps: 500
+  lambda_util: 0.0002
+  lambda_reuse: 0.01
+  lambda_div: 0.01
+  lambda_norm: 0.0001
+  lambda_sparse: 0.0
+  lambda_z: 0.01
+  lambda_keyorth: 0.0
+  lambda_vec_div: 0.0
+  lr_pool: 1.0e-05
+  lr_parts: 5.0e-05
+  lr_retrieval: 5.0e-05
+  lr_threshold: 5.0e-04
+  lr_min_scale: 1.0
+  batch_size: 32
+  steps_per_window: 16
+  seed: 42
+  lr_warmup_steps: 500
+  ema_decay: 0.99
+  grad_clip_norm: 1.0
+  nan_emergency_stop: 5
+  loss_spike_sigma: 5.0
+  dead_vector_threshold: 1.0e-06
+  revival_interval_steps: 10    # 10× more frequent (was 100)
+  max_revival_frac: 0.15        # revive up to 15% = 9830 vectors/event (was 2%)
+  revival_noise_factor: 0.10   # larger noise so revived vectors diverge from donors (was 0.02)
+sharding:
+  n_model: 2
+data:
+  source: tiny_stories
+  hf_path: roneneldan/TinyStories
+  hf_text_column: text
+  gen_every: 2000
+  val_every: 500
+  val_batches: 16
+checkpoint:
+  dir: ''
+  every: 0
+  resume: false
+  keep: 1

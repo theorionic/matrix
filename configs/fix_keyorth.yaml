@@ -1,0 +1,90 @@
+# Fix A: Key + Vector Orthogonality regularization.
+#
+# Problem: pool collapse happens because pool keys all cluster in the same region
+# of the d_k=64 key space. Once keys cluster, all queries route to the same few
+# vectors — the positive feedback loop that drives active_frac to 13%.
+#
+# Fix: penalise off-diagonal cosine² in a subsampled (256) key gram matrix and in
+# a subsampled (128) pool vector gram matrix. This directly counteracts key-space
+# clustering without touching the routing mechanism, giving every region of key
+# space an incentive to be distinct.
+#
+# lambda_keyorth=5.0: at random init, l_keyorth≈0; at heavy collapse (many keys
+#   aligned), l_keyorth≈0.3 → contribution≈1.5, comparable to task loss.
+# lambda_vec_div=2.0: vectors are D=4096-dim, so random cosine≈0; contribution
+#   rises only if content-space clustering appears.
+name: fix_keyorth
+model:
+  D: 4096
+  N: 65536
+  use_ivf: true
+  C: 256
+  m: 8
+  d_A: 256
+  d_B: 256
+  r: 4
+  k_max: 16
+  S: 4
+  d_k: 64
+  T: 2.0
+  n_heads: 4
+  n_kv_heads: 1
+  use_rope: true
+  n_layers_A: 4
+  n_layers_B: 4
+  ffn_mult: 4
+  vocab_size: 32000
+  seq_len: 256
+  gamma_init: 0.1
+  bf16_pool: true
+  compute_dtype: bfloat16
+  remat: false
+  use_flash_attn: false
+  vocab_parallel: true
+train:
+  warmup_steps: 500
+  gate_on_steps: 5000
+  total_steps: 10000
+  lambda_gate_start: 1.0
+  lambda_gate_end: 3.0
+  lambda_sharpen_end: 10.0
+  gate_ramp_steps: 500
+  lambda_util: 0.0002
+  lambda_reuse: 0.01
+  lambda_div: 0.01
+  lambda_norm: 0.0001
+  lambda_sparse: 0.0
+  lambda_z: 0.01
+  lambda_keyorth: 5.0    # key-space orthogonality (main fix)
+  lambda_vec_div: 2.0    # content-space diversity (reinforcing fix)
+  lr_pool: 1.0e-05
+  lr_parts: 5.0e-05
+  lr_retrieval: 5.0e-05
+  lr_threshold: 5.0e-04
+  lr_min_scale: 1.0
+  batch_size: 32
+  steps_per_window: 16
+  seed: 42
+  lr_warmup_steps: 500
+  ema_decay: 0.99
+  grad_clip_norm: 1.0
+  nan_emergency_stop: 5
+  loss_spike_sigma: 5.0
+  dead_vector_threshold: 1.0e-06
+  revival_interval_steps: 100
+  max_revival_frac: 0.02
+  revival_noise_factor: 0.02
+sharding:
+  n_model: 2
+data:
+  source: tiny_stories
+  hf_path: roneneldan/TinyStories
+  hf_text_column: text
+  gen_every: 2000
+  val_every: 500
+  val_batches: 16
+checkpoint:
+  dir: ''
+  every: 0
+  resume: false
+  keep: 1

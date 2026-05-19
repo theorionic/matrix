@@ -1200,7 +1200,30 @@ def _revive_dead_vectors(
         dead_idx = dead_idx[np.argsort(dead_ema)[:max_revive]]
         n_dead = max_revive
 
-    chosen_donors = rng.choice(donor_idx, size=n_dead, replace=True)
+    # Cross-cluster donor selection (when IVF is active):
+    # For each dead vector in cluster c_dead, prefer donors from the most-active
+    # DIFFERENT cluster. This places revived vectors near query-rich regions that
+    # the dead vector's own cluster cannot reach, spreading coverage across clusters.
+    if cfg.use_ivf:
+        N_per_C = cfg.N // cfg.C
+        cluster_activity = np.array([
+            ema_np[c * N_per_C: (c + 1) * N_per_C].sum() for c in range(cfg.C)
+        ])
+        chosen_donors = np.empty(n_dead, dtype=np.int64)
+        for k_i, d_i in enumerate(dead_idx):
+            c_dead = int(d_i) // N_per_C
+            # Activity scores: zero out dead vector's own cluster so we prefer others
+            rival = cluster_activity.copy()
+            rival[c_dead] = -1.0
+            best_cluster = int(np.argmax(rival))
+            c_start, c_end = best_cluster * N_per_C, (best_cluster + 1) * N_per_C
+            cluster_donors = donor_idx[(donor_idx >= c_start) & (donor_idx < c_end)]
+            if len(cluster_donors) == 0:
+                cluster_donors = donor_idx  # fallback: any active donor
+            chosen_donors[k_i] = rng.choice(cluster_donors)
+    else:
+        chosen_donors = rng.choice(donor_idx, size=n_dead, replace=True)
+
     donor_norm = float(np.linalg.norm(pool_np[chosen_donors], axis=-1).mean()) + 1e-8
     noise = rng.normal(0.0, tcfg.revival_noise_factor * donor_norm / (cfg.d_k ** 0.5),
                        (n_dead, cfg.D)).astype(pool_np.dtype)

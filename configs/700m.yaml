@@ -64,7 +64,7 @@ train:
   lr_retrieval: 5.0e-05
   lr_threshold: 5.0e-04
   lr_min_scale: 1.0
-  batch_size: 32
+  batch_size: 64
   steps_per_window: 16  # fewer steps per window; each step is ~5× more expensive
   seed: 42
   lr_warmup_steps: 1000

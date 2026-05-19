@@ -7,14 +7,15 @@ from .config import DWAConfig, TrainConfig
 
 
 def aux_losses(
-    alphas: jnp.ndarray,      # [B, k_max] — normalized assembly weights
-    indices: jnp.ndarray,     # [B, k_max] — pool indices
-    pool_keys: jnp.ndarray,   # [S, N, d_k]
-    W: jnp.ndarray,           # [B, d_B, d_A] — assembled weight matrix
-    W_base: jnp.ndarray,      # [d_B, d_A]
-    soft_full: jnp.ndarray,   # [B, N_cands] — full pre-top-k soft distribution
+    alphas: jnp.ndarray,        # [B, k_max] — normalized assembly weights
+    indices: jnp.ndarray,       # [B, k_max] — pool indices
+    pool_keys: jnp.ndarray,     # [S, N, d_k]
+    W: jnp.ndarray,             # [B, d_B, d_A] — assembled weight matrix
+    W_base: jnp.ndarray,        # [d_B, d_A]
+    soft_full: jnp.ndarray,     # [B, N_cands] — full pre-top-k soft distribution
     cfg: DWAConfig,
     tcfg: TrainConfig,
+    pool_vectors: jnp.ndarray | None = None,  # [N, D] — raw pool vectors (optional)
 ) -> dict[str, jnp.ndarray]:
     """
     Compute all four auxiliary losses.  All inputs are plain jnp arrays
@@ -68,18 +69,51 @@ def aux_losses(
     safe_alpha = jnp.clip(alphas, 1e-8, 1.0)
     l_sparse = -(safe_alpha * jnp.log(safe_alpha)).sum(axis=-1).mean()
 
+    # L_keyorth: push pool keys to be orthogonal across the full key space.
+    # Root cause of routing collapse: when many keys cluster in the same direction,
+    # all queries prefer the same handful of vectors — once they dominate, gradient
+    # to others vanishes. Penalising off-diagonal cosine² in a subsampled key gram
+    # directly prevents this without touching the routing mechanism itself.
+    S_k, N_k, dk = pool_keys.shape
+    stride_k = max(1, N_k // 256)
+    sub_keys = pool_keys[:, ::stride_k, :]                             # [S, ~256, d_k]
+    Ks = sub_keys.shape[1]
+    k_n = sub_keys / (jnp.linalg.norm(sub_keys, axis=-1, keepdims=True) + 1e-8)
+    gram_k = jnp.einsum("skd,sld->skl", k_n, k_n)                    # [S, Ks, Ks]
+    off_k = gram_k * (1.0 - jnp.eye(Ks, dtype=gram_k.dtype)[None])
+    l_keyorth = (off_k ** 2).mean()
+
+    # L_vec_div: push pool vectors to be orthogonal in content space.
+    # Keys are projections of vectors; orthogonal vectors produce orthogonal keys,
+    # so this reinforces l_keyorth at a deeper level. Only computed when the caller
+    # passes pool_vectors (adding it to forward_and_loss is optional).
+    if pool_vectors is not None:
+        stride_v = max(1, N_k // 128)
+        sub_v = pool_vectors[::stride_v].astype(jnp.float32)          # [~128, D]
+        Kv = sub_v.shape[0]
+        v_n = sub_v / (jnp.linalg.norm(sub_v, axis=-1, keepdims=True) + 1e-8)
+        gram_v = v_n @ v_n.T                                           # [Kv, Kv]
+        off_v = gram_v * (1.0 - jnp.eye(Kv, dtype=gram_v.dtype))
+        l_vec_div = (off_v ** 2).mean()
+    else:
+        l_vec_div = jnp.zeros(())
+
     return {
         "l_util": l_util,
         "l_reuse": l_reuse,
         "l_div": l_div,
         "l_norm": l_norm,
         "l_sparse": l_sparse,
+        "l_keyorth": l_keyorth,
+        "l_vec_div": l_vec_div,
         "total_aux": (
             tcfg.lambda_util * l_util
             + tcfg.lambda_reuse * l_reuse
             + tcfg.lambda_div * l_div
             + tcfg.lambda_norm * l_norm
             + tcfg.lambda_sparse * l_sparse
+            + tcfg.lambda_keyorth * l_keyorth
+            + tcfg.lambda_vec_div * l_vec_div
         ),
     }
 
