@@ -728,6 +728,176 @@ class TinyStoriesLoader:
 
 
 # ---------------------------------------------------------------------------
+# StreamingLoader — streaming HF dataset, auto-scaled fetch, background prefetch
+# ---------------------------------------------------------------------------
+
+class StreamingLoader:
+    """
+    Primary data loader for HuggingFace datasets.
+
+    Design goals (all three must hold together):
+      1. No full download — HF streaming iter(), never materialises the whole dataset.
+      2. One fetch covers ≥1 full training window — FETCH_SIZE auto-scaled to
+         steps_per_window × batch_size × seq_len / avg_story_tokens.
+      3. Zero stalls — background daemon thread packs the next batch while the
+         TPU trains the current window, so get_window() almost never waits.
+
+    Multi-host: ds.shard(num_shards=process_count, index=process_index) gives
+    each host a non-overlapping, shuffled slice of the dataset — same guarantee
+    as grain.ShardOptions without requiring the full dataset to be downloaded.
+
+    Checkpoint / resume:
+      Saves (buf, stories_consumed).  On resume, the stream is re-built and
+      .skip(stories_consumed) is called to reach approximately the same position.
+      This is approximate (not bit-exact) — the important invariant is that the
+      packed-token buffer is restored exactly, so the next get_window() returns
+      the same sequences that would have followed without interruption.
+    """
+
+    _AVG_STORY_TOKENS = 150   # conservative estimate; used only for FETCH_SIZE tuning
+
+    def __init__(
+        self,
+        tokenizer,
+        seq_len: int,
+        steps_per_window: int,
+        batch_size: int,                          # per-host batch size
+        hf_path: str = "roneneldan/TinyStories",
+        text_column: str = "text",
+        process_index: int = 0,
+        process_count: int = 1,
+        seed: int = 42,
+    ):
+        self.tokenizer      = tokenizer
+        self.seq_len        = seq_len
+        self.eos            = tokenizer.eos_token_id or 0
+        self.hf_path        = hf_path
+        self.text_column    = text_column
+        self.process_index  = process_index
+        self.process_count  = process_count
+        self.seed           = seed
+
+        # Scale FETCH_SIZE so one fetch covers ≥2 full windows.
+        # Formula: seqs_needed = 2 × steps × batch;  stories = seqs × seq_len / avg_tokens
+        seqs_2_windows = 2 * steps_per_window * batch_size
+        self._fetch_size = max(10_000, seqs_2_windows * seq_len // self._AVG_STORY_TOKENS)
+
+        _log(f"[Loader] Streaming {hf_path!r}  shard {process_index}/{process_count}  "
+              f"seq_len={seq_len}  fetch={self._fetch_size:,} stories/batch "
+              f"(covers ≈{seqs_2_windows:,} seqs = 2 windows)")
+
+        self._stories_consumed: int = 0
+        self._buf     = np.empty((0, seq_len), dtype=np.int32)
+        self._buf_pos = 0
+        self._pf_buf: np.ndarray | None = None
+        self._pf_event = threading.Event()
+
+        self._ds_iter = self._make_iter()
+
+        # Blocking first fill — ensures data is ready before the first window
+        self._buf = self._fetch_and_pack()
+        _log(f"[Loader] Ready: {len(self._buf):,} seqs buffered")
+
+        # Kick off background prefetch immediately so window-2 data is ready on time
+        self._start_prefetch()
+
+    def _make_iter(self, skip: int = 0):
+        from datasets import load_dataset
+        ds = load_dataset(self.hf_path, split="train", streaming=True)
+        if self.process_count > 1:
+            ds = ds.shard(num_shards=self.process_count, index=self.process_index)
+        ds = ds.shuffle(seed=self.seed, buffer_size=10_000)
+        if skip > 0:
+            ds = ds.skip(skip)
+        return iter(ds)
+
+    def _fetch_and_pack(self) -> np.ndarray:
+        """Fetch _fetch_size stories from the stream; pack into [N, seq_len] int32."""
+        texts: list[str] = []
+        while len(texts) < self._fetch_size:
+            try:
+                row = next(self._ds_iter)
+                texts.append(row[self.text_column])
+                self._stories_consumed += 1
+            except StopIteration:
+                # Dataset exhausted — restart for indefinite training
+                self._ds_iter = self._make_iter()
+                self._stories_consumed = 0
+
+        ids_list = self.tokenizer(
+            texts, add_special_tokens=False,
+            return_attention_mask=False, return_token_type_ids=False,
+        )["input_ids"]
+
+        total = sum(len(s) + 2 for s in ids_list)
+        flat  = np.empty(total, dtype=np.int32)
+        pos   = 0
+        for ids in ids_list:
+            n = len(ids)
+            flat[pos]                  = self.eos
+            flat[pos + 1 : pos + 1 + n] = ids
+            flat[pos + 1 + n]          = self.eos
+            pos += n + 2
+
+        n_seqs = pos // self.seq_len
+        return flat[: n_seqs * self.seq_len].reshape(n_seqs, self.seq_len)
+
+    def _start_prefetch(self) -> None:
+        self._pf_event.clear()
+        def _worker():
+            self._pf_buf = self._fetch_and_pack()
+            self._pf_event.set()
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _refill(self) -> None:
+        """Swap in the prefetched buffer; log a warning if it wasn't ready yet."""
+        if not self._pf_event.is_set():
+            _log("[Loader] Waiting for prefetch — FETCH_SIZE may be too small for this config")
+        self._pf_event.wait()
+        leftover      = self._buf[self._buf_pos:]
+        new_seqs      = self._pf_buf
+        self._buf     = np.concatenate([leftover, new_seqs], axis=0) if len(leftover) else new_seqs
+        self._buf_pos = 0
+        self._start_prefetch()
+
+    def get_window(self, steps: int, batch_size: int) -> np.ndarray:
+        needed = steps * batch_size
+        while len(self._buf) - self._buf_pos < needed:
+            self._refill()
+        out           = self._buf[self._buf_pos : self._buf_pos + needed]
+        self._buf_pos += needed
+        return out.reshape(steps, batch_size, self.seq_len)
+
+    def state_dict(self) -> dict:
+        return {
+            "buf":              self._buf[self._buf_pos:],
+            "stories_consumed": np.array(self._stories_consumed, dtype=np.int64),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore loader state from a checkpoint dict.  Stream position is approximate."""
+        self._pf_event.wait()   # let any in-flight prefetch finish first
+        skip = int(state.get("stories_consumed", 0))
+        if skip > 0:
+            _log(f"[Loader] Resuming: skipping ≈{skip:,} stories to restore stream position …")
+        self._stories_consumed = skip
+        self._ds_iter = self._make_iter(skip=skip)
+        buf_data = state.get("buf")
+        if buf_data is not None and len(buf_data):
+            arr = np.asarray(buf_data, dtype=np.int32)
+            if arr.ndim == 2:
+                self._buf = arr
+            else:
+                n = len(arr) // self.seq_len
+                self._buf = arr[: n * self.seq_len].reshape(n, self.seq_len)
+        else:
+            self._buf = np.empty((0, self.seq_len), dtype=np.int32)
+        self._buf_pos = 0
+        self._start_prefetch()
+        _log(f"[Loader] Restored: {len(self._buf):,} seqs buffered, prefetch started")
+
+
+# ---------------------------------------------------------------------------
 # Validation cache — fixed validation set preloaded once at startup
 # ---------------------------------------------------------------------------
 
@@ -1126,7 +1296,15 @@ def save_checkpoint(
     if loader is not None:
         step_dir = os.path.join(ckpt_dir, str(steps_done))
         os.makedirs(step_dir, exist_ok=True)
-        if isinstance(loader, GrainLoader):
+        if isinstance(loader, StreamingLoader):
+            # Per-host npz: packed token buffer + approximate stream position
+            state = loader.state_dict()
+            np.savez(
+                os.path.join(step_dir, f"loader_state_{process_index}.npz"),
+                buf=state["buf"],
+                stories_consumed=state["stories_consumed"],
+            )
+        elif isinstance(loader, GrainLoader):
             # 1. Grain iterator position via PyGrainCheckpointHandler (atomic, orbax-managed)
             import grain.python as grain
             grain_mngr = _get_grain_ckpt_manager(ckpt_dir, process_index, keep)
@@ -1231,14 +1409,20 @@ def load_checkpoint(
     steps_done  = int(restored["meta"]["steps_done"])
 
     # --- Loader state ---
-    # Returns a dict that train() will pass to loader.set_state() or load_state_dict().
-    # For GrainLoader: {"grain_mngr": manager, "step": int, "buf": array}
-    # For TinyStoriesLoader: {"buf": array}  (legacy format)
-    step_dir = os.path.join(ckpt_dir, str(steps_done_target))
-    buf_path = os.path.join(step_dir, f"loader_buf_{process_index}.npz")
-    grain_dir = os.path.join(ckpt_dir, f"grain_p{process_index}")
+    # Priority: StreamingLoader format > GrainLoader format > legacy TinyStoriesLoader
+    step_dir       = os.path.join(ckpt_dir, str(steps_done_target))
+    streaming_path = os.path.join(step_dir, f"loader_state_{process_index}.npz")
+    buf_path       = os.path.join(step_dir, f"loader_buf_{process_index}.npz")
+    grain_dir      = os.path.join(ckpt_dir, f"grain_p{process_index}")
 
-    if os.path.isdir(grain_dir) and os.path.exists(buf_path):
+    if os.path.exists(streaming_path):
+        # StreamingLoader format: buf + stories_consumed
+        d = np.load(streaming_path)
+        loader_state = {
+            "buf":              d["buf"] if "buf" in d.files else np.empty((0,), dtype=np.int32),
+            "stories_consumed": int(d["stories_consumed"]) if "stories_consumed" in d.files else 0,
+        }
+    elif os.path.isdir(grain_dir) and os.path.exists(buf_path):
         # Grain loader format: restore iterator via PyGrainCheckpointHandler
         try:
             import grain.python as grain  # noqa: F401
@@ -1532,27 +1716,21 @@ def train(run_cfg: RunConfig) -> None:
     _log(f"[DWA] FLOPs/step (fwd+bwd, approx): {step_flops / 1e9:.1f}G"
           f"  (data={data_label})")
 
-    # Data loader — prefer Grain (exact resume + multi-host sharding) with fallback.
+    # Data loader — StreamingLoader: no full download, multi-host sharding, background prefetch.
+    # FETCH_SIZE is auto-scaled to cover ≥2 windows per fetch so the background
+    # thread always finishes before the next get_window() call needs data.
     loader = None
     if tokenizer is not None:
-        try:
-            import grain.python  # noqa: F401 — just probe availability
-            loader = GrainLoader(
-                tokenizer, cfg.seq_len,
-                hf_path=run_cfg.data.hf_path,
-                text_column=run_cfg.data.hf_text_column,
-                process_index=process_index,
-                process_count=process_count,
-                seed=tcfg.seed,
-            )
-            _log(f"[DWA] Loader: Grain  (process {process_index}/{process_count})")
-        except ImportError:
-            loader = TinyStoriesLoader(
-                tokenizer, cfg.seq_len,
-                hf_path=run_cfg.data.hf_path,
-                text_column=run_cfg.data.hf_text_column,
-            )
-            _log("[DWA] Loader: TinyStoriesLoader (install grain-nightly for multi-host sharding)")
+        loader = StreamingLoader(
+            tokenizer, cfg.seq_len,
+            steps_per_window=tcfg.steps_per_window,
+            batch_size=per_host_batch,
+            hf_path=run_cfg.data.hf_path,
+            text_column=run_cfg.data.hf_text_column,
+            process_index=process_index,
+            process_count=process_count,
+            seed=tcfg.seed,
+        )
 
     # Validation cache — preloaded once, fixed for the entire run
     val_every  = run_cfg.data.val_every
