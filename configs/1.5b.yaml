@@ -1,0 +1,97 @@
+# DWA 1.5B — pool-dominant architecture with a wide backbone and large vocabulary
+#
+# Parameter breakdown (~1.61B total capacity):
+#   Pool (N×D):       65536 × 16384 = 1.073B  (66.8%)  ← biggest component
+#   Parts A+B:        12+12 layers @ d=1280 = 401.1M  (24.9%)
+#   Embed + LM head:  50257 × 1280 × 2    = 128.7M  ( 8.0%)
+#   Key proj + other:                     =   4.8M  ( 0.3%)
+#
+# r=4 is the maximum rank for D=16384, d_A=d_B=1280:
+#   needs D >= r*(d_A+d_B)+d_B = 4*2560+1280 = 11520 <= 16384 ✓
+#   effective assembled rank = k_max * r = 16 * 4 = 64  (rank-64 updates to W ∈ R^{1280×1280})
+#
+# Sharding: n_model=4 auto-selected (pool+Adam=10.7GB → 2.68GB/device with 4-way model-parallel)
+#   → 4-way model parallel × 2-way data parallel on 8 chips
+#
+# seq_len=1024: at d_A=1280, attention is perfectly tile-aligned with 10 heads of dim 128.
+#   → FFN/projection matmuls dominate → better TPU MXU MFU overall
+#
+
+name: 1.5b
+model:
+  D: 16384
+  N: 65536
+  use_ivf: true
+  C: 256          # sqrt(N)=256 keeps IVF cluster size = N/C = 256
+  m: 8
+  d_A: 1280
+  d_B: 1280
+  r: 4            # max rank for D=16384, d_A=d_B=1280
+  k_max: 16
+  S: 4
+  d_k: 64
+  n_heads: 10     # d_head = 1280/10 = 128 — perfectly fills TPU MXU 128-tile
+  n_kv_heads: 1   # 10:1 GQA; kv_dim = 1*128 = 128
+  use_rope: true
+  n_layers_A: 12
+  n_layers_B: 12
+  ffn_mult: 4
+  vocab_size: 50257   # larger vocabulary to understand complex token patterns
+  seq_len: 1024
+  gamma_init: 0.1
+  bf16_pool: true
+  compute_dtype: bfloat16
+  remat: true
+  use_flash_attn: false
+  vocab_parallel: true
+  # Hypernetwork pool settings — saves memory during training, compiles to standard pool for inference
+  use_hypernetwork: true
+  d_emb: 128
+  mlp_hidden_dims:
+    - 512
+    - 1024
+train:
+  warmup_steps: 500
+  gate_on_steps: 5000
+  total_steps: 50000
+  lambda_gate_start: 1.0
+  lambda_gate_end: 3.0
+  lambda_sharpen_end: 10.0
+  gate_ramp_steps: 500
+  lambda_util: 0.0002   # keeps utilization penalty balanced for large pools
+  lambda_reuse: 0.01    # prevents gradient explosion during warmup
+  lambda_div: 0.01
+  lambda_norm: 0.0001   # strong W-drift prevention to avoid assembly explosion
+  lambda_sparse: 0.0
+  lambda_z: 0.01
+  lr_pool: 1.0e-05      # low LR for 1.07B parameter pool
+  lr_parts: 5.0e-05     # low LR for big transformer
+  lr_retrieval: 5.0e-05
+  lr_threshold: 5.0e-04
+  lr_min_scale: 1.0
+  batch_size: 8
+  steps_per_window: 16  # fewer steps per window due to larger model scale
+  seed: 42
+  lr_warmup_steps: 1000
+  ema_decay: 0.99
+  grad_clip_norm: 1.0
+  nan_emergency_stop: 5
+  loss_spike_sigma: 5.0
+  dead_vector_threshold: 1.0e-06
+  revival_interval_steps: 100   # frequent checks for active pool usage
+  max_revival_frac: 0.02
+  revival_noise_factor: 0.02
+sharding:
+  n_model: auto         # automatic SPMD mesh sharding across TPU pod slice
+data:
+  source: tiny_stories
+  hf_path: roneneldan/TinyStories
+  hf_text_column: text
+  gen_every: 500
+  val_every: 500
+  val_batches: 16
+checkpoint:
+  dir: ''
+  every: 1000
+  resume: false
+  keep: 3
