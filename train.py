@@ -1342,7 +1342,10 @@ def save_checkpoint(
             # TinyStoriesLoader: only host 0 (backward compat)
             state = loader.state_dict()
             loader_path = os.path.join(step_dir, "loader_state.npz")
-            np.savez(loader_path, buf=state["buf"])
+            save_kwargs = {"buf": state["buf"]}
+            if "cursor" in state:
+                save_kwargs["cursor"] = np.array(state["cursor"], dtype=np.int32)
+            np.savez(loader_path, **save_kwargs)
 
     _log(f"[Ckpt] Saved step {steps_done} → {ckpt_dir}/{steps_done}/")
 
@@ -1481,6 +1484,8 @@ def load_checkpoint(
         if os.path.exists(legacy_path):
             d = np.load(legacy_path)
             loader_state = {"buf": d["buf"]}
+            if "cursor" in d.files:
+                loader_state["cursor"] = int(d["cursor"])
         else:
             buf_npy = os.path.join(step_dir, "buf.npy")
             buf = np.load(buf_npy) if os.path.exists(buf_npy) else np.empty((0,), dtype=np.int32)

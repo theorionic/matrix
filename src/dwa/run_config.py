@@ -147,6 +147,8 @@ def _build_dwa_config(raw: dict) -> DWAConfig:
     """Build DWAConfig from a raw YAML dict, handling compute_dtype."""
     raw = dict(raw)   # copy so we can pop
     compute_dtype_str = raw.pop("compute_dtype", None)
+    if "mlp_hidden_dims" in raw and raw["mlp_hidden_dims"] is not None:
+        raw["mlp_hidden_dims"] = tuple(raw["mlp_hidden_dims"])
     unknown = set(raw) - _MODEL_FIELDS
     if unknown:
         raise ValueError(f"Unknown model config keys: {unknown}")
@@ -158,6 +160,8 @@ def _build_dwa_config(raw: dict) -> DWAConfig:
 def _dwa_config_to_dict(cfg: DWAConfig) -> dict:
     d = dataclasses.asdict(cfg)
     d["compute_dtype"] = _dtype_to_str(cfg.compute_dtype)
+    if "mlp_hidden_dims" in d and isinstance(d["mlp_hidden_dims"], tuple):
+        d["mlp_hidden_dims"] = list(d["mlp_hidden_dims"])
     return d
 
 

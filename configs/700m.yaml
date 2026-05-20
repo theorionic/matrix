@@ -45,6 +45,8 @@ model:
   remat: true
   use_flash_attn: false
   vocab_parallel: true
+  # Hypernetwork pool settings
+  use_hypernetwork: true
 train:
   warmup_steps: 500
   gate_on_steps: 5000
