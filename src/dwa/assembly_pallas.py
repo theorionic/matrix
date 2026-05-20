@@ -39,13 +39,28 @@ import jax.experimental.pallas as pl
 # Pure-JAX reference (used as fallback and for gradient testing)
 # ---------------------------------------------------------------------------
 
+@functools.partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8))
 def assemble_jax(
-    gathered: jnp.ndarray,   # [B, k, D]
-    alphas: jnp.ndarray,     # [B, k]
-    h_A: jnp.ndarray,        # [B, T, d_A]
-    W_base: jnp.ndarray,     # [d_B, d_A]
-    b_base: jnp.ndarray,     # [d_B]
-    gamma: jnp.ndarray,      # scalar
+    gathered: jnp.ndarray,
+    alphas: jnp.ndarray,
+    h_A: jnp.ndarray,
+    W_base: jnp.ndarray,
+    b_base: jnp.ndarray,
+    gamma: jnp.ndarray,
+    d_B: int,
+    r: int,
+    d_A: int,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    return _assemble_jax_impl(gathered, alphas, h_A, W_base, b_base, gamma, d_B, r, d_A)
+
+
+def _assemble_jax_impl(
+    gathered: jnp.ndarray,
+    alphas: jnp.ndarray,
+    h_A: jnp.ndarray,
+    W_base: jnp.ndarray,
+    b_base: jnp.ndarray,
+    gamma: jnp.ndarray,
     d_B: int,
     r: int,
     d_A: int,
@@ -75,6 +90,25 @@ def assemble_jax(
     return h_mid, W
 
 
+def _assemble_jax_fwd(
+    gathered: jnp.ndarray,
+    alphas: jnp.ndarray,
+    h_A: jnp.ndarray,
+    W_base: jnp.ndarray,
+    b_base: jnp.ndarray,
+    gamma: jnp.ndarray,
+    d_B: int,
+    r: int,
+    d_A: int,
+):
+    primals_out = _assemble_jax_impl(gathered, alphas, h_A, W_base, b_base, gamma, d_B, r, d_A)
+    h_mid, W = primals_out
+    residuals = (gathered, alphas, h_A, W, gamma)
+    return primals_out, residuals
+
+
+
+
 # ---------------------------------------------------------------------------
 # Pallas assembly kernel (forward only — backward handled by custom_vjp)
 # ---------------------------------------------------------------------------
@@ -89,19 +123,17 @@ def _choose_b_block(B: int, T: int, d_B: int, kr: int, d_A: int,
     """Pick the largest Bb ∈ {1,2,4,8} that fits VMEM for the assembly kernel.
 
     Per-tile VMEM budget (inputs + intermediates + output):
-        Bb × [T*d_A + kr*d_A + kr*d_B + d_B*d_A + d_B
-              + T*kr + 2*T*d_B + T*d_A] × elem_bytes
+        Bb × [T*d_A + kr*d_A + kr*d_B + T*kr + 3*T*d_B] × elem_bytes
 
     For medium config (d=128, T=256, kr=192): Bb=8 → ~7 MB ✓
-    For 700m config (d=768, T=1024, kr=64):  Bb=1 → ~15.6 MB — no Bb fits.
+    For 700m config (d=768, T=1024, kr=64):  Bb=1 → ~12.6 MB — Bb=1 fits now!
 
     Also enforces Mosaic alignment: Bb must equal B (full batch) or be
     divisible by 8 (second-to-last dim rule for rank-2 block specs).
 
     Returns 0 if no valid Bb exists (caller should fall back to pure JAX).
     """
-    per_row = (T * d_A + kr * d_A + kr * d_B + d_B * d_A + d_B
-               + T * kr + 2 * T * d_B + T * d_A) * elem_bytes
+    per_row = (T * d_A + kr * d_A + kr * d_B + T * kr + 3 * T * d_B) * elem_bytes
     for Bb in (8, 4, 2, 1):
         if Bb > B or B % Bb != 0:
             continue
@@ -122,47 +154,43 @@ def _make_pallas_kernel(B: int, T: int, d_B: int, kr: int, d_A: int, dtype=jnp.f
 
     Inputs are pre-factored by the caller so all BlockSpec dimensions satisfy
     Mosaic's alignment constraints:
-        V_scaled [B, kr, d_A]  — alpha-scaled V factors; kr=k*r
-        h_A      [B, T,  d_A]  — Part A hidden states
-        U_flat   [B, kr, d_B]  — reshaped U factors
-        W_base   [d_B, d_A]    — replicated base weight
-        pb       [B, d_B]      — pre-computed alpha-weighted bias (b_base included)
-        gamma    [1]            — residual scale (scalar reshaped to rank-1)
+        V_scaled    [B, kr, d_A]  — alpha-scaled V factors; kr=k*r
+        h_A         [B, T,  d_A]  — Part A hidden states
+        U_flat      [B, kr, d_B]  — reshaped U factors
+        h_base_bias [B, T,  d_B]  — pre-computed base projection and bias contribution
+        gamma       [1]           — residual scale (scalar reshaped to rank-1)
 
     Bb (batch tile) is auto-selected to fit the per-tile VMEM budget (~14 MB).
     dtype matches the activation dtype (float32 or bfloat16).
     """
     Bb = _choose_b_block(B, T, d_B, kr, d_A, jnp.dtype(dtype).itemsize)
 
-    def _kernel(Vs_ref, hA_ref, Uf_ref, Wb_ref, pb_ref, gm_ref, out_ref):
-        Vs    = Vs_ref[...]        # [Bb, kr, d_A]
-        hA    = hA_ref[...]       # [Bb, T, d_A]
-        Uf    = Uf_ref[...]       # [Bb, kr, d_B]
-        Wb    = Wb_ref[...]       # [d_B, d_A]
-        pb    = pb_ref[...]       # [Bb, d_B]
-        gamma = gm_ref[0]
+    def _kernel(Vs_ref, hA_ref, Uf_ref, h_base_bias_ref, gm_ref, out_ref):
+        Vs          = Vs_ref[...]          # [Bb, kr, d_A]
+        hA          = hA_ref[...]         # [Bb, T, d_A]
+        Uf          = Uf_ref[...]         # [Bb, kr, d_B]
+        h_base_bias = h_base_bias_ref[...] # [Bb, T, d_B]
+        gamma       = gm_ref[0]
 
         # Two batch matmuls replace the k-loop:
         #   h_A @ V_scaled^T → [Bb, T, kr]: captures alpha-scaled V projections
         #   (h_A@Vs^T) @ U_flat → [Bb, T, d_B]: assembles weighted residual
         h_V         = jnp.matmul(hA, Vs.transpose(0, 2, 1))  # [Bb, T, kr]
         h_res_delta = jnp.matmul(h_V, Uf)                     # [Bb, T, d_B]
-        h_base      = jnp.matmul(hA, Wb.T)                    # [Bb, T, d_B]
 
-        out_ref[...] = hA + gamma * (h_base + h_res_delta) + pb[:, None, :]
+        out_ref[...] = h_base_bias + gamma * h_res_delta
 
     return pl.pallas_call(
         _kernel,
-        out_shape=jax.ShapeDtypeStruct((B, T, d_A), dtype),
+        out_shape=jax.ShapeDtypeStruct((B, T, d_B), dtype),
         in_specs=[
             pl.BlockSpec((Bb, kr, d_A), lambda i: (i, 0, 0)),  # V_scaled
             pl.BlockSpec((Bb, T,  d_A), lambda i: (i, 0, 0)),  # h_A
             pl.BlockSpec((Bb, kr, d_B), lambda i: (i, 0, 0)),  # U_flat
-            pl.BlockSpec((d_B, d_A),    lambda i: (0, 0)),      # W_base (full)
-            pl.BlockSpec((Bb, d_B),     lambda i: (i, 0)),      # pb
+            pl.BlockSpec((Bb, T,  d_B), lambda i: (i, 0, 0)),  # h_base_bias
             pl.BlockSpec((1,),          lambda i: (0,)),         # gamma
         ],
-        out_specs=pl.BlockSpec((Bb, T, d_A), lambda i: (i, 0, 0)),
+        out_specs=pl.BlockSpec((Bb, T, d_B), lambda i: (i, 0, 0)),
         grid=(B // Bb,),
     )
 
@@ -212,13 +240,16 @@ def _pallas_assemble_forward(
     pb       = (b_base.astype(compute_dtype) +
                 jnp.einsum("bk,bkd->bd", alphas, b_vec))            # [B, d_B]
 
+    # Pre-compute static W_base projection and bias on TPU MXUs before custom kernel
+    h_base      = jnp.matmul(h_A, W_base.T.astype(compute_dtype))   # [B, T, d_B]
+    h_base_bias = h_A.astype(compute_dtype) + gamma[:, None, None] * h_base + pb[:, None, :]  # [B, T, d_B]
+
     key = (B, T, d_B, kr, d_A, compute_dtype)
     if key not in _kernel_cache:
         _kernel_cache[key] = _make_pallas_kernel(B, T, d_B, kr, d_A, dtype=compute_dtype)
     return _kernel_cache[key](
         V_scaled, h_A, U_flat,
-        W_base.astype(compute_dtype),
-        pb,
+        h_base_bias,
         gamma.reshape(1).astype(compute_dtype),
     )
 
@@ -331,20 +362,15 @@ def _pallas_assemble_bwd(d_B: int, r: int, d_A: int, residuals, g):
     g_W_base   = g_W_total.sum(0)                        # [d_B,d_A]
     g_delta_W  = g_W_total                               # [B,d_B,d_A]
 
-    # delta_W = sum_k alpha_k * (U_k @ V_k)
-    UV = jnp.matmul(
-        U.reshape(B * k, d_B, r), V.reshape(B * k, r, d_A)
-    ).reshape(B, k, d_B, d_A)                           # [B,k,d_B,d_A]
-
-    # g_alpha from delta_W: g_alpha[b,k] = sum_{j,i} UV[b,k,j,i] * g_delta_W[b,j,i]
-    g_alpha_dW = jnp.einsum("bkji,bji->bk", UV, g_delta_W)   # [B,k]
-
     # g_U[b,k,j,r] = alpha[b,k] * sum_i g_delta_W[b,j,i] * V[b,k,r,i]
     #              = alpha * (g_delta_W @ V^T_per_k)
     # g_delta_W[:,None]: [B,1,d_B,d_A]; V.T: [B,k,d_A,r]
-    g_U = (alphas[:, :, None, None] *
-           jnp.matmul(g_delta_W[:, None, :, :],
-                      V.transpose(0, 1, 3, 2)))          # [B,k,d_B,r]
+    temp_U = jnp.matmul(g_delta_W[:, None, :, :], V.transpose(0, 1, 3, 2))  # [B,k,d_B,r]
+    g_U = alphas[:, :, None, None] * temp_U                                 # [B,k,d_B,r]
+
+    # g_alpha from delta_W: g_alpha[b,k] = sum_{j,i} UV[b,k,j,i] * g_delta_W[b,j,i]
+    # By exploiting matrix product associativity: sum_{j,r} U[b,k,j,r] * temp_U[b,k,j,r]
+    g_alpha_dW = jnp.einsum("bkjr,bkjr->bk", U, temp_U)                     # [B,k]
 
     # g_V[b,k,r,i] = alpha[b,k] * sum_j U[b,k,j,r] * g_delta_W[b,j,i]
     #              = alpha * (U^T @ g_delta_W)
@@ -372,6 +398,7 @@ def _pallas_assemble_bwd(d_B: int, r: int, d_A: int, residuals, g):
 
 
 pallas_assemble.defvjp(_pallas_assemble_fwd, _pallas_assemble_bwd)
+assemble_jax.defvjp(_assemble_jax_fwd, _pallas_assemble_bwd)
 
 
 # ---------------------------------------------------------------------------
