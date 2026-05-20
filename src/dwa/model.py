@@ -184,16 +184,25 @@ class DWAModel(nnx.Module):
 
         # Gather pool vectors [B, k_max, D]; uses distributed gather when pool is
         # model-sharded so we never all-gather the full 4 GB pool across devices.
-        pool_vecs = self.pool.vectors[...]
         use_dist = (
             mesh is not None
             and "model" in mesh.axis_names
             and mesh.shape["model"] > 1
         )
-        if use_dist:
-            gathered = _distributed_gather(pool_vecs, indices, mesh)
+        if self.pool.cfg.use_hypernetwork:
+            emb = self.pool.embeddings[...]
+            if use_dist:
+                gathered_emb = _distributed_gather(emb, indices, mesh)
+            else:
+                gathered_emb = emb[indices]
+            gathered = self.pool.mlp(gathered_emb)
         else:
-            gathered = pool_vecs[indices]
+            pool_vecs = self.pool.vectors[...]
+            if use_dist:
+                gathered = _distributed_gather(pool_vecs, indices, mesh)
+            else:
+                gathered = pool_vecs[indices]
+
         if gathered.dtype != jnp.float32:
             gathered = gathered.astype(jnp.float32)
 

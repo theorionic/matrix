@@ -50,6 +50,11 @@ class DWAConfig:
     use_flash_attn: bool = False  # Pallas flash attention (hits VMEM limit inside scan+vjp; inference-only)
     vocab_parallel: bool = True   # shard lm_head across model axis — avoids materialising full [B,T,V] logits
 
+    # Hypernetwork pool generator (swapping memory bandwidth for compute)
+    use_hypernetwork: bool = False
+    d_emb: int = 128
+    mlp_hidden_dims: tuple[int, ...] = (512, 1024)
+
     # Exploration noise (Gumbel) added to retrieval scores during warmup top-k.
     # Annealed via (1 - gate_mix) so noise fades as the gate ramps in.
     # 0.0 disables (recovers old deterministic top-k); 0.5 is a good default for

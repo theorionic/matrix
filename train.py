@@ -1189,7 +1189,6 @@ def _revive_dead_vectors(
         return 0, pool_ema
 
     dead_idx = np.where(dead_mask)[0]
-    pool_np  = np.array(model.pool.vectors[...], dtype=np.float32)
     rng      = np.random.default_rng(step)
 
     # Cap revivals to avoid massive simultaneous parameter perturbations.
@@ -1201,18 +1200,35 @@ def _revive_dead_vectors(
         n_dead = max_revive
 
     chosen_donors = rng.choice(donor_idx, size=n_dead, replace=True)
-    donor_norm = float(np.linalg.norm(pool_np[chosen_donors], axis=-1).mean()) + 1e-8
-    noise = rng.normal(0.0, tcfg.revival_noise_factor * donor_norm / (cfg.d_k ** 0.5),
-                       (n_dead, cfg.D)).astype(pool_np.dtype)
-    pool_np[dead_idx] = pool_np[chosen_donors] + noise
 
-    # Put back — honour the existing sharding (model-parallel or replicated)
-    orig_arr = model.pool.vectors[...]
-    new_jax  = jnp.array(pool_np, dtype=orig_arr.dtype)
-    orig_sharding = getattr(orig_arr, "sharding", None)
-    if orig_sharding is not None:
-        new_jax = jax.device_put(new_jax, orig_sharding)
-    model.pool.vectors[...] = new_jax
+    if cfg.use_hypernetwork:
+        # Revive at the coordinate embeddings level
+        emb_np = np.array(model.pool.embeddings[...], dtype=np.float32)
+        donor_norm = float(np.linalg.norm(emb_np[chosen_donors], axis=-1).mean()) + 1e-8
+        noise = rng.normal(0.0, tcfg.revival_noise_factor * donor_norm / (cfg.d_emb ** 0.5),
+                           (n_dead, cfg.d_emb)).astype(emb_np.dtype)
+        emb_np[dead_idx] = emb_np[chosen_donors] + noise
+
+        orig_arr = model.pool.embeddings[...]
+        new_jax  = jnp.array(emb_np, dtype=orig_arr.dtype)
+        orig_sharding = getattr(orig_arr, "sharding", None)
+        if orig_sharding is not None:
+            new_jax = jax.device_put(new_jax, orig_sharding)
+        model.pool.embeddings[...] = new_jax
+    else:
+        # Standard pool revival
+        pool_np  = np.array(model.pool.vectors[...], dtype=np.float32)
+        donor_norm = float(np.linalg.norm(pool_np[chosen_donors], axis=-1).mean()) + 1e-8
+        noise = rng.normal(0.0, tcfg.revival_noise_factor * donor_norm / (cfg.d_k ** 0.5),
+                           (n_dead, cfg.D)).astype(pool_np.dtype)
+        pool_np[dead_idx] = pool_np[chosen_donors] + noise
+
+        orig_arr = model.pool.vectors[...]
+        new_jax  = jnp.array(pool_np, dtype=orig_arr.dtype)
+        orig_sharding = getattr(orig_arr, "sharding", None)
+        if orig_sharding is not None:
+            new_jax = jax.device_put(new_jax, orig_sharding)
+        model.pool.vectors[...] = new_jax
 
     # Boost EMA for revived vectors so they survive ~700 steps (1e-3 / (1-0.99) = 0.1
     # effective selection rate) before next revival check, giving L_reuse time to
@@ -1379,24 +1395,46 @@ def load_checkpoint(
     pool_sharding = NamedSharding(mesh, P("model", None)) if (mesh is not None and n_model > 1) else None
 
     if pool_sharding is not None:
-        # Re-shard pool vectors without materialising the full array on one device:
-        # slice each device's rows and put them directly.
-        pool_np  = np.array(restored["model"]["pool"]["vectors"])  # host numpy [N, D]
-        N_local  = pool_np.shape[0] // n_model
-        idx_map  = pool_sharding.addressable_devices_indices_map(pool_np.shape)
-        per_dev  = []
-        for dev in pool_sharding.addressable_devices:
-            rows = idx_map[dev][0]
-            shard = jax.device_put(
-                jnp.array(pool_np[rows], dtype=model.pool.vectors[...].dtype), dev
+        if "vectors" in restored["model"]["pool"]:
+            # Re-shard pool vectors without materialising the full array on one device:
+            # slice each device's rows and put them directly.
+            pool_np  = np.array(restored["model"]["pool"]["vectors"])  # host numpy [N, D]
+            N_local  = pool_np.shape[0] // n_model
+            idx_map  = pool_sharding.addressable_devices_indices_map(pool_np.shape)
+            per_dev  = []
+            for dev in pool_sharding.addressable_devices:
+                rows = idx_map[dev][0]
+                shard = jax.device_put(
+                    jnp.array(pool_np[rows], dtype=model.pool.vectors[...].dtype), dev
+                )
+                per_dev.append(shard)
+            sharded_pool = jax.make_array_from_single_device_arrays(
+                pool_np.shape, pool_sharding, per_dev
             )
-            per_dev.append(shard)
-        sharded_pool = jax.make_array_from_single_device_arrays(
-            pool_np.shape, pool_sharding, per_dev
-        )
-        # Update model params without pool first, then fix pool
-        nnx.update(model, restored["model"])
-        model.pool.vectors[...] = sharded_pool
+            # Update model params without pool first, then fix pool
+            nnx.update(model, restored["model"])
+            model.pool.vectors[...] = sharded_pool
+        elif "embeddings" in restored["model"]["pool"]:
+            # Re-shard coordinate embeddings without materialising the full array on one device:
+            emb_np  = np.array(restored["model"]["pool"]["embeddings"])  # host numpy [N, d_emb]
+            N_local  = emb_np.shape[0] // n_model
+            emb_sharding = NamedSharding(mesh, P("model", None))
+            idx_map  = emb_sharding.addressable_devices_indices_map(emb_np.shape)
+            per_dev  = []
+            for dev in emb_sharding.addressable_devices:
+                rows = idx_map[dev][0]
+                shard = jax.device_put(
+                    jnp.array(emb_np[rows], dtype=model.pool.embeddings[...].dtype), dev
+                )
+                per_dev.append(shard)
+            sharded_emb = jax.make_array_from_single_device_arrays(
+                emb_np.shape, emb_sharding, per_dev
+            )
+            # Update model params
+            nnx.update(model, restored["model"])
+            model.pool.embeddings[...] = sharded_emb
+        else:
+            raise KeyError("Neither 'vectors' nor 'embeddings' found in pool checkpoint model state")
     else:
         nnx.update(model, restored["model"])
 
