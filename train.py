@@ -422,6 +422,35 @@ def _synthetic_window(
 
 
 # ---------------------------------------------------------------------------
+# HuggingFace split auto-detection
+# ---------------------------------------------------------------------------
+
+def _detect_hf_splits(hf_path: str, hf_subset: str = "") -> tuple[str, str | None]:
+    """
+    Probe the dataset for available splits and return (train_split, val_split).
+
+    val_split is None when no validation/test split is found — validation loss
+    will be skipped in that case.  Falls back to ("train", None) on any error.
+    """
+    try:
+        from datasets import get_dataset_split_names
+        kwargs = {"config_name": hf_subset} if hf_subset else {}
+        splits = get_dataset_split_names(hf_path, **kwargs)
+    except Exception as e:
+        _log(f"[Loader] Could not detect splits for {hf_path!r}: {e} — assuming 'train'")
+        return "train", None
+
+    train_candidates = ["train", "training"]
+    val_candidates   = ["validation", "valid", "val", "dev", "test"]
+
+    train_split = next((s for s in train_candidates if s in splits), splits[0])
+    val_split   = next((s for s in val_candidates   if s in splits), None)
+
+    _log(f"[Loader] {hf_path!r} splits={splits}  → train={train_split!r}  val={val_split!r}")
+    return train_split, val_split
+
+
+# ---------------------------------------------------------------------------
 # Grain data loader — multi-host sharding + exact preemption resume
 # ---------------------------------------------------------------------------
 
@@ -461,7 +490,9 @@ class GrainLoader:
         tokenizer,
         seq_len: int,
         hf_path: str = "roneneldan/TinyStories",
+        hf_subset: str = "",
         text_column: str = "text",
+        split: str = "train",
         process_index: int = 0,
         process_count: int = 1,
         seed: int = 42,
@@ -476,8 +507,9 @@ class GrainLoader:
         self._process_index = process_index
         self._process_count = process_count
 
-        _log(f"[Grain] Loading {hf_path!r} for indexed access (process {process_index}/{process_count})…")
-        ds = load_dataset(hf_path, split="train")
+        _log(f"[Grain] Loading {hf_path!r} split={split!r} for indexed access (process {process_index}/{process_count})…")
+        load_kwargs = {"name": hf_subset} if hf_subset else {}
+        ds = load_dataset(hf_path, split=split, **load_kwargs)
         self._source = _HFDataSource(ds, text_column)
         _log(f"[Grain] Dataset: {len(self._source):,} stories  "
              f"shard {process_index}/{process_count}")
@@ -619,15 +651,19 @@ class TinyStoriesLoader:
 
     def __init__(self, tokenizer, seq_len: int,
                  hf_path: str = "roneneldan/TinyStories",
-                 text_column: str = "text"):
+                 hf_subset: str = "",
+                 text_column: str = "text",
+                 split: str = "train"):
         from datasets import load_dataset
         self.tokenizer   = tokenizer
         self.seq_len     = seq_len
         self.hf_path     = hf_path
+        self.hf_subset   = hf_subset
         self.text_column = text_column
         self.eos         = tokenizer.eos_token_id or 0
 
-        self.ds          = load_dataset(hf_path, split="train", streaming=True)
+        load_kwargs = {"name": hf_subset} if hf_subset else {}
+        self.ds          = load_dataset(hf_path, split=split, streaming=True, **load_kwargs)
         self._batch_iter = self.ds.iter(batch_size=self.FETCH_SIZE)
         self._buf        = np.empty((0, seq_len), dtype=np.int32)
         self._buf_pos    = 0
@@ -763,7 +799,9 @@ class StreamingLoader:
         steps_per_window: int,
         batch_size: int,                          # per-host batch size
         hf_path: str = "roneneldan/TinyStories",
+        hf_subset: str = "",
         text_column: str = "text",
+        split: str = "train",
         process_index: int = 0,
         process_count: int = 1,
         seed: int = 42,
@@ -772,7 +810,9 @@ class StreamingLoader:
         self.seq_len        = seq_len
         self.eos            = tokenizer.eos_token_id or 0
         self.hf_path        = hf_path
+        self.hf_subset      = hf_subset
         self.text_column    = text_column
+        self._train_split   = split
         self.process_index  = process_index
         self.process_count  = process_count
         self.seed           = seed
@@ -803,7 +843,8 @@ class StreamingLoader:
 
     def _make_iter(self, skip: int = 0):
         from datasets import load_dataset
-        ds = load_dataset(self.hf_path, split="train", streaming=True)
+        load_kwargs = {"name": self.hf_subset} if self.hf_subset else {}
+        ds = load_dataset(self.hf_path, split=self._train_split, streaming=True, **load_kwargs)
         if self.process_count > 1:
             ds = ds.shard(num_shards=self.process_count, index=self.process_index)
         ds = ds.shuffle(seed=self.seed, buffer_size=10_000)
@@ -910,9 +951,11 @@ class _ValCache:
     """
 
     def __init__(self, tokenizer, seq_len: int, hf_path: str, text_column: str,
-                 val_batches: int, batch_size: int):
+                 val_batches: int, batch_size: int,
+                 hf_subset: str = "", split: str = "validation"):
         from datasets import load_dataset
-        ds    = load_dataset(hf_path, split="validation", streaming=True)
+        load_kwargs = {"name": hf_subset} if hf_subset else {}
+        ds    = load_dataset(hf_path, split=split, streaming=True, **load_kwargs)
         eos   = tokenizer.eos_token_id or 0
         batch = next(iter(ds.iter(batch_size=100_000)))
         texts = batch[text_column]
@@ -1700,13 +1743,22 @@ def train(run_cfg: RunConfig) -> None:
     # --- Data source setup (before model build so vocab_size is set) ---
     tokenizer   = None
     use_pattern = False
-    if run_cfg.data.source == "tiny_stories":
-        from transformers import GPT2TokenizerFast
-        tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-        # Pad to the nearest multiple of 64 ≥ 50257 so vocab_parallel sharding
+    _train_split: str       = "train"
+    _val_split:   str | None = None
+    if run_cfg.data.source in ("tiny_stories", "hf"):
+        from transformers import AutoTokenizer
+        tok_name  = run_cfg.data.hf_tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tok_name)
+        if tokenizer.eos_token_id is None:
+            tokenizer.add_special_tokens({"eos_token": "<|endoftext|>"})
+        # Pad vocab to nearest multiple of 64 so vocab_parallel sharding
         # divides evenly for any n_model in {1,2,4,8}.
-        cfg.vocab_size = ((tokenizer.vocab_size + 63) // 64) * 64   # 50304
-        _log(f"[DWA] TinyStories mode: GPT-2 tokenizer, padded vocab_size={cfg.vocab_size}")
+        cfg.vocab_size = ((tokenizer.vocab_size + 63) // 64) * 64
+        _log(f"[DWA] HF dataset mode: tokenizer={tok_name!r}  "
+             f"padded vocab_size={cfg.vocab_size}")
+        _train_split, _val_split = _detect_hf_splits(
+            run_cfg.data.hf_path, run_cfg.data.hf_subset
+        )
     elif run_cfg.data.source == "pattern":
         use_pattern = True
 
@@ -1761,7 +1813,7 @@ def train(run_cfg: RunConfig) -> None:
     _print_param_table(model)
 
     step_flops = compute_step_flops(cfg, tcfg)
-    data_label = "tiny_stories" if tokenizer is not None else ("pattern" if use_pattern else "random")
+    data_label = run_cfg.data.hf_path if tokenizer is not None else ("pattern" if use_pattern else "random")
     _log(f"[DWA] FLOPs/step (fwd+bwd, approx): {step_flops / 1e9:.1f}G"
           f"  (data={data_label})")
 
@@ -1775,23 +1827,44 @@ def train(run_cfg: RunConfig) -> None:
             steps_per_window=tcfg.steps_per_window,
             batch_size=per_host_batch,
             hf_path=run_cfg.data.hf_path,
+            hf_subset=run_cfg.data.hf_subset,
             text_column=run_cfg.data.hf_text_column,
+            split=_train_split,
             process_index=process_index,
             process_count=process_count,
             seed=tcfg.seed,
         )
 
-    # Validation cache — preloaded once, fixed for the entire run
+    # Validation cache — preloaded once, fixed for the entire run.
+    # If val_hf_path is set, use it as a separate validation dataset (auto-detect its splits).
+    # Otherwise fall back to the training dataset's detected val split.
+    # Skipped entirely if no validation split is available.
     val_every  = run_cfg.data.val_every
     val_cache: "_ValCache | None" = None
     if tokenizer is not None and val_every > 0:
-        val_cache = _ValCache(
-            tokenizer, cfg.seq_len,
-            hf_path=run_cfg.data.hf_path,
-            text_column=run_cfg.data.hf_text_column,
-            val_batches=run_cfg.data.val_batches,
-            batch_size=tcfg.batch_size,
-        )
+        _val_hf_path   = run_cfg.data.val_hf_path   or run_cfg.data.hf_path
+        _val_hf_subset = run_cfg.data.val_hf_subset or run_cfg.data.hf_subset
+        _val_text_col  = run_cfg.data.val_hf_text_column or run_cfg.data.hf_text_column
+        # Separate val dataset: always auto-detect its train split (use as the val split here).
+        # Same dataset: use the already-detected _val_split.
+        if run_cfg.data.val_hf_path:
+            _effective_val_split, _ = _detect_hf_splits(_val_hf_path, _val_hf_subset)
+            _log(f"[Val] Using separate validation dataset: {_val_hf_path!r}  "
+                 f"split={_effective_val_split!r}")
+        else:
+            _effective_val_split = _val_split
+        if _effective_val_split is not None:
+            val_cache = _ValCache(
+                tokenizer, cfg.seq_len,
+                hf_path=_val_hf_path,
+                text_column=_val_text_col,
+                val_batches=run_cfg.data.val_batches,
+                batch_size=tcfg.batch_size,
+                hf_subset=_val_hf_subset,
+                split=_effective_val_split,
+            )
+        else:
+            _log("[Val] No validation split found — validation loss disabled.")
 
     # Pallas assembly uses custom_vjp: forward runs in VMEM (fused, no HBM
     # writes for delta_W / U / V intermediates), backward is pure-JAX (no

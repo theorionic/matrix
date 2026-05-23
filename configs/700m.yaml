@@ -81,9 +81,14 @@ train:
 sharding:
   n_model: 2            # explicit: 2-way model parallel (pool sharded), 4-way data parallel
 data:
-  source: tiny_stories
+  source: hf
   hf_path: roneneldan/TinyStories
+  hf_subset: ''
   hf_text_column: text
+  hf_tokenizer: gpt2
+  val_hf_path: ''
+  val_hf_subset: ''
+  val_hf_text_column: ''
   gen_every: 500
   val_every: 500
   val_batches: 16

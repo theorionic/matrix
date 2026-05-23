@@ -46,10 +46,16 @@ class ShardingConfig:
 @dataclass
 class DataConfig:
     """Dataset and generation options."""
-    source: str = "random"       # "random" | "tiny_stories" | "pattern"
-    hf_path: str = "roneneldan/TinyStories"   # HuggingFace dataset path (tiny_stories mode)
+    source: str = "random"       # "random" | "tiny_stories" | "hf" | "pattern"
+    hf_path: str = "roneneldan/TinyStories"   # HuggingFace dataset path
+    hf_subset: str = ""                       # dataset config/subset name (empty = default)
     hf_text_column: str = "text"              # column containing raw text
-    gen_every: int = 100         # generate text sample every N steps (tiny_stories only)
+    hf_tokenizer: str = "gpt2"               # HuggingFace tokenizer path or name
+    # Validation dataset — leave empty to reuse training dataset fields
+    val_hf_path: str = ""        # separate HF dataset for validation (empty = same as hf_path)
+    val_hf_subset: str = ""      # subset/config for val dataset (empty = same as hf_subset)
+    val_hf_text_column: str = "" # text column for val dataset (empty = same as hf_text_column)
+    gen_every: int = 100         # generate text sample every N steps (hf/tiny_stories only)
     val_every: int = 500         # compute validation loss every N steps (0 = disabled)
     val_batches: int = 32        # number of batches used for each val loss estimate
 
