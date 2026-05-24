@@ -89,7 +89,7 @@ data:
   val_hf_path: ''
   val_hf_subset: ''
   val_hf_text_column: ''
-  gen_every: 1000
+  gen_every: 2000
   gen_prompts:
     - "The history of artificial intelligence"
     - "In recent years, researchers have discovered"
@@ -98,6 +98,6 @@ data:
   val_batches: 16
 checkpoint:
   dir: '/kaggle/working/matrix/checkpoints'
-  every: 1000
+  every: 5000
   resume: false
   keep: 3
