@@ -98,6 +98,6 @@ data:
   val_batches: 16
 checkpoint:
   dir: '/kaggle/working/matrix/checkpoints'
-  every: 2000
+  every: 50000
   resume: false
   keep: 3
