@@ -126,18 +126,18 @@ def _choose_b_block(B: int, T: int, d_B: int, kr: int, d_A: int,
         Bb × [T*d_A + kr*d_A + kr*d_B + T*kr + 3*T*d_B] × elem_bytes
 
     For medium config (d=128, T=256, kr=192): Bb=8 → ~7 MB ✓
-    For 700m config (d=768, T=1024, kr=64):  Bb=1 → ~12.6 MB — Bb=1 fits now!
+    For 700m config (d=768, T=1024, kr=64):  Bb=2 → ~12.6 MB ✓
 
-    Also enforces Mosaic alignment: Bb must equal B (full batch) or be
-    divisible by 8 (second-to-last dim rule for rank-2 block specs).
+    Mosaic alignment: all block specs are rank-3 (Bb, T|kr, d). The Mosaic
+    second-to-last rule applies to T/kr (both already 8-aligned) and the
+    last-dim rule applies to d (768, 8-aligned for bf16). Bb itself is the
+    grid-tiling dimension and has no alignment requirement.
 
     Returns 0 if no valid Bb exists (caller should fall back to pure JAX).
     """
     per_row = (T * d_A + kr * d_A + kr * d_B + T * kr + 3 * T * d_B) * elem_bytes
     for Bb in (8, 4, 2, 1):
         if Bb > B or B % Bb != 0:
-            continue
-        if Bb != B and Bb % 8 != 0:
             continue
         if Bb * per_row <= _VMEM_BUDGET:
             return Bb
@@ -242,7 +242,7 @@ def _pallas_assemble_forward(
 
     # Pre-compute static W_base projection and bias on TPU MXUs before custom kernel
     h_base      = jnp.matmul(h_A, W_base.T.astype(compute_dtype))   # [B, T, d_B]
-    h_base_bias = h_A.astype(compute_dtype) + gamma[:, None, None] * h_base + pb[:, None, :]  # [B, T, d_B]
+    h_base_bias = h_A.astype(compute_dtype) + gamma * h_base + pb[:, None, :]  # [B, T, d_B]
 
     key = (B, T, d_B, kr, d_A, compute_dtype)
     if key not in _kernel_cache:

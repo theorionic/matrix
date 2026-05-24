@@ -82,9 +82,9 @@ sharding:
   n_model: 2            # explicit: 2-way model parallel (pool sharded), 4-way data parallel
 data:
   source: hf
-  hf_path: roneneldan/TinyStories
+  hf_path: openbmb/Ultra-FineWeb
   hf_subset: ''
-  hf_text_column: text
+  hf_text_column: content
   hf_tokenizer: gpt2
   val_hf_path: ''
   val_hf_subset: ''

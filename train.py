@@ -283,7 +283,7 @@ def compute_step_flops(cfg: DWAConfig, tcfg: TrainConfig) -> int:
 # ---------------------------------------------------------------------------
 
 def _make_train_window(cfg: DWAConfig, tcfg: TrainConfig, is_warmup: bool, aux_on: bool,
-                       use_pallas: bool = True, mesh=None, gate_mix: float = 1.0):
+                       use_pallas: bool = True, mesh=None):
     """
     Returns a compiled function that runs steps_per_window training steps
     inside a single jax.lax.scan call.
@@ -296,6 +296,8 @@ def _make_train_window(cfg: DWAConfig, tcfg: TrainConfig, is_warmup: bool, aux_o
       (one kernel per device, each sees its local batch slice).
 
     is_warmup, aux_on, use_pallas, and mesh are static closures.
+    gate_mix is passed as a per-step JAX array through the scan so it can
+    vary each window without triggering recompilation.
     """
 
     @functools.partial(nnx.jit, static_argnames={})
@@ -304,6 +306,7 @@ def _make_train_window(cfg: DWAConfig, tcfg: TrainConfig, is_warmup: bool, aux_o
         optimizer: nnx.Optimizer,
         data: jnp.ndarray,           # [steps_per_window, B, seq_len]
         lambda_vals: jnp.ndarray,    # [steps_per_window]
+        gate_mix_vals: jnp.ndarray,  # [steps_per_window]
         pool_ema_in: jnp.ndarray,    # [N]
         ema_decay: float,
     ) -> tuple[DWAModel, nnx.Optimizer, jnp.ndarray, dict]:
@@ -316,7 +319,7 @@ def _make_train_window(cfg: DWAConfig, tcfg: TrainConfig, is_warmup: bool, aux_o
 
         def step_fn(carry, xs):
             model, optimizer, pool_ema, step_in_window = carry
-            batch, lam = xs  # batch: [B, seq_len], lam: scalar
+            batch, lam, gate_mix = xs  # batch: [B, seq_len], lam/gate_mix: scalars
 
             def loss_fn(m):
                 return forward_and_loss(
@@ -366,7 +369,7 @@ def _make_train_window(cfg: DWAConfig, tcfg: TrainConfig, is_warmup: bool, aux_o
 
         init_carry = (model, optimizer, pool_ema_in, jnp.array(0))
         (model, optimizer, pool_ema_out, _), (losses, all_indices, grad_norms, nan_flags) = (
-            jax.lax.scan(step_fn, init_carry, (data, lambda_vals))
+            jax.lax.scan(step_fn, init_carry, (data, lambda_vals, gate_mix_vals))
         )
 
         # ── EMA centroid update ───────────────────────────────────────────────
@@ -1798,7 +1801,8 @@ def train(run_cfg: RunConfig) -> None:
     per_host_batch  = local_batch * n_data_local   # == batch_size for single-host
 
     scheduler = PhaseScheduler(tcfg)
-    lambda_array = scheduler.make_lambda_array()     # [total_steps]
+    lambda_array   = scheduler.make_lambda_array()                                           # [total_steps]
+    gate_mix_array = jnp.array([scheduler.gate_mix(s) for s in range(tcfg.total_steps)])    # [total_steps]
 
     # Initialise model.  For configs needing model parallelism (n_model > 1),
     # create the pool directly on each device's HBM before building the model
@@ -1877,22 +1881,18 @@ def train(run_cfg: RunConfig) -> None:
         _log(f"[DWA] Pallas assembly: disabled (probe failed — falling back to pure JAX)")
 
     # Pre-JIT train windows for each phase
-    # (re-compilation happens at phase boundaries or gate_mix changes)
+    # Recompilation happens only at phase boundaries (is_warmup changes once).
+    # gate_mix is now a per-step JAX array threaded through the scan, so it
+    # never appears in the compile key.
     compiled_fns: dict[tuple, object] = {}
 
-    def get_train_fn(is_warmup: bool, aux_on: bool, gate_mix: float):
-        # Quantize gate_mix to 0.25 steps for caching.  Coarser than 0.1 — only
-        # 4 buckets across the gate ramp → ~4 recompiles instead of 10 (saving
-        # ~3 min of compile time per run).  The boost-factor change between
-        # adjacent buckets is small enough that training dynamics aren't affected.
-        gm_q = round(gate_mix * 4) / 4.0
-        key = (is_warmup, aux_on, gm_q)
+    def get_train_fn(is_warmup: bool, aux_on: bool):
+        key = (is_warmup, aux_on)
         if key not in compiled_fns:
             compiled_fns[key] = _make_train_window(
                 cfg, tcfg, is_warmup, aux_on,
                 use_pallas=_use_pallas,
                 mesh=mesh,
-                gate_mix=gm_q,
             )
         return compiled_fns[key]
 
@@ -2002,8 +2002,9 @@ def train(run_cfg: RunConfig) -> None:
         is_warmup = scheduler.is_warmup(start_step)
         aux_on = scheduler.aux_enabled(start_step)
 
-        # Slice lambda schedule for this window
+        # Slice lambda and gate_mix schedules for this window
         lam_window = lambda_array[start_step: start_step + tcfg.steps_per_window]
+        gm_window  = gate_mix_array[start_step: start_step + tcfg.steps_per_window]
 
         # Build this host's local data slice [steps, per_host_batch, seq_len].
         # In multi-host mode each host independently provides its own non-overlapping
@@ -2030,11 +2031,10 @@ def train(run_cfg: RunConfig) -> None:
             data_local, mesh, P(None, "data", None)
         )
 
-        gate_mix = scheduler.gate_mix(start_step)
-        train_fn = get_train_fn(is_warmup, aux_on, gate_mix)
+        train_fn = get_train_fn(is_warmup, aux_on)
         t_win = time.time()
         model, optimizer, pool_ema, info = train_fn(
-            model, optimizer, data_sharded, lam_window, pool_ema, tcfg.ema_decay,
+            model, optimizer, data_sharded, lam_window, gm_window, pool_ema, tcfg.ema_decay,
         )
         # Block until TPU computation finishes before timing
         jax.block_until_ready(

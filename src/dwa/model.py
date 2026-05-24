@@ -352,7 +352,7 @@ def forward_and_loss(
         # lambda_util / lambda_reuse weights are calibrated to keep
         # contributions small in absolute terms — too small to counter the
         # selection feedback loop.
-        gm   = float(gate_mix)
+        gm   = gate_mix
         lo   = tcfg.sharpen_aux_scale
         hi   = tcfg.warmup_aux_scale
         boost = lo + (hi - lo) * (1.0 - gm)

@@ -54,7 +54,7 @@ class MultiAspectRetrieval(nnx.Module):
         pool_keys: jnp.ndarray,   # [S, N, d_k]  (may be N_local when model-sharded)
         lambda_val: float,        # sharpness
         is_warmup: bool,          # static
-        gate_mix: float = 0.0,   # 0.0 = pure warmup, 1.0 = pure gate; linear blend
+        gate_mix = 0.0,          # 0.0 = pure warmup, 1.0 = pure gate; JAX scalar or float
         mesh=None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
@@ -167,15 +167,12 @@ class MultiAspectRetrieval(nnx.Module):
         # every vector has non-zero selection probability during warmup.  Noise
         # scale anneals via (1 - gate_mix) → vanishes once the gate is fully on.
         # Seed is derived from z (varies per-batch) to avoid threading RNGs.
-        # gate_mix is a static Python float here (captured in JIT closure), so
-        # this whole expression evaluates at compile time to a constant.
-        # Floor at min_explore_noise so even at gate_mix=1.0, deterministic
-        # top-k never resumes — empirically required to prevent late-stage
-        # pool collapse with large pools (N ≥ 16K).
-        explore_sigma = float(max(
-            cfg.min_explore_noise,
-            cfg.warmup_explore_noise * (1.0 - float(gate_mix)),
-        ))
+        # explore_sigma anneals with gate_mix; computed with JAX ops so gate_mix
+        # can be a traced scalar (no Python float() needed).
+        explore_sigma = jnp.maximum(
+            jnp.float32(cfg.min_explore_noise),
+            cfg.warmup_explore_noise * (1.0 - gate_mix),
+        )
 
         def _explore_scores(scores):
             # Deterministic per-batch seed: hash z into a uint32 via bit-cast.
@@ -223,10 +220,12 @@ class MultiAspectRetrieval(nnx.Module):
 
         if is_warmup:
             alphas, indices, soft_full_out = warmup_select(None)
-        elif gate_mix <= 0.0:
-            alphas, indices, soft_full_out = warmup_select(None)
-        elif gate_mix >= 1.0:
-            alphas, indices, soft_full_out = gate_select(None)
         else:
-            alphas, indices, soft_full_out = blended_select(None)
+            # gate_mix may be a JAX traced scalar — use lax.switch so gate_mix
+            # can vary per-step without triggering recompilation.
+            idx = jnp.where(gate_mix <= 0.0, 0,
+                            jnp.where(gate_mix >= 1.0, 2, 1)).astype(jnp.int32)
+            alphas, indices, soft_full_out = jax.lax.switch(
+                idx, [warmup_select, blended_select, gate_select], None
+            )
         return alphas, indices, soft_full_out, l_z
