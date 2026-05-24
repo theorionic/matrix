@@ -5,7 +5,10 @@ import jax.numpy as jnp
 from flax import nnx
 
 from .assembly import WeightAssembler
-from .assembly_pallas import assemble_jax, pallas_assemble, shard_pallas_assemble
+from .assembly_pallas import (
+    assemble_jax, pallas_assemble, shard_pallas_assemble,
+    fused_gather_assemble,
+)
 from .config import DWAConfig, TrainConfig
 from .losses import aux_losses, task_loss
 from .parts import PartA, PartB, precompute_rope_freqs
@@ -189,46 +192,67 @@ class DWAModel(nnx.Module):
             and "model" in mesh.axis_names
             and mesh.shape["model"] > 1
         )
-        if self.pool.cfg.use_hypernetwork:
-            emb = self.pool.embeddings[...]
-            if use_dist:
-                gathered_emb = _distributed_gather(emb, indices, mesh)
-            else:
-                gathered_emb = emb[indices]
-            gathered = self.pool.mlp(gathered_emb)
-        else:
-            pool_vecs = self.pool.vectors[...]
-            if use_dist:
-                gathered = _distributed_gather(pool_vecs, indices, mesh)
-            else:
-                gathered = pool_vecs[indices]
-
-        if gathered.dtype != jnp.float32:
-            gathered = gathered.astype(jnp.float32)
-
         # Assembly — Pallas kernel keeps W in VMEM; falls back to pure JAX
         W_base = self.assembler.W_base[...]
         b_base = self.assembler.b_base[...]
         gamma  = self.assembler.gamma[...]
 
-        if use_pallas and mesh is not None:
-            h_mid_no_ln, W = shard_pallas_assemble(
-                gathered, alphas, h_A, W_base, b_base, gamma,
-                cfg.d_B, cfg.r, cfg.d_A, mesh,
-            )
-            h_mid = self.assembler.layer_norm(h_mid_no_ln)
-        elif use_pallas:
-            h_mid_no_ln, W = pallas_assemble(
-                gathered, alphas, h_A, W_base, b_base, gamma,
-                cfg.d_B, cfg.r, cfg.d_A,
-            )
-            h_mid = self.assembler.layer_norm(h_mid_no_ln)
+        if self.pool.cfg.use_hypernetwork:
+            # Hypernetwork generates full D-dim vectors on the fly; gather embeddings
+            emb = self.pool.embeddings[...]
+            if use_dist:
+                gathered_emb = _distributed_gather(emb, indices, mesh)
+            else:
+                gathered_emb = emb[indices]
+            gathered = self.pool.mlp(gathered_emb).astype(jnp.float32)
+            if use_pallas and mesh is not None:
+                h_mid_no_ln, W = shard_pallas_assemble(
+                    gathered, alphas, h_A, W_base, b_base, gamma,
+                    cfg.d_B, cfg.r, cfg.d_A, mesh,
+                )
+            elif use_pallas:
+                h_mid_no_ln, W = pallas_assemble(
+                    gathered, alphas, h_A, W_base, b_base, gamma,
+                    cfg.d_B, cfg.r, cfg.d_A,
+                )
+            else:
+                h_mid_no_ln, W = assemble_jax(
+                    gathered, alphas, h_A, W_base, b_base, gamma,
+                    cfg.d_B, cfg.r, cfg.d_A,
+                )
         else:
-            h_mid_no_ln, W = assemble_jax(
-                gathered, alphas, h_A, W_base, b_base, gamma,
-                cfg.d_B, cfg.r, cfg.d_A,
-            )
-            h_mid = self.assembler.layer_norm(h_mid_no_ln)
+            pool_vecs = self.pool.vectors[...].astype(jnp.float32)
+            if use_dist:
+                # Distributed model-sharded path: full gather required
+                gathered = _distributed_gather(pool_vecs, indices, mesh)
+                if use_pallas and mesh is not None:
+                    h_mid_no_ln, W = shard_pallas_assemble(
+                        gathered, alphas, h_A, W_base, b_base, gamma,
+                        cfg.d_B, cfg.r, cfg.d_A, mesh,
+                    )
+                else:
+                    h_mid_no_ln, W = assemble_jax(
+                        gathered, alphas, h_A, W_base, b_base, gamma,
+                        cfg.d_B, cfg.r, cfg.d_A,
+                    )
+            elif use_pallas:
+                # TPU single-device: split-pool gather + Pallas VMEM assembly.
+                # split_pool_gather reads only s3 = d_B*r + r*d_A + d_B floats/vec
+                # instead of D, reducing HBM bandwidth by D/s3 (1.3–3.6× at configs).
+                from .assembly_pallas import split_pool_gather
+                gathered = split_pool_gather(pool_vecs, indices, cfg.d_B, cfg.r, cfg.d_A)
+                h_mid_no_ln, W = pallas_assemble(
+                    gathered, alphas, h_A, W_base, b_base, gamma,
+                    cfg.d_B, cfg.r, cfg.d_A,
+                )
+            else:
+                # CPU / no-Pallas: fused gather+assembly — split gather avoids [B,k,D]
+                h_mid_no_ln, W = fused_gather_assemble(
+                    pool_vecs, indices, alphas, h_A, W_base, b_base, gamma,
+                    cfg.d_B, cfg.r, cfg.d_A,
+                )
+
+        h_mid = self.assembler.layer_norm(h_mid_no_ln)
 
         # Part B
         h_out = self.part_b(h_mid, cos, sin, mesh)                    # [B, T, d_B]

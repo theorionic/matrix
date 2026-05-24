@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "Dynamic Weight Assembly (DWA) model training on TPU v5 lite"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "flax>=0.10.7",
+    "jax>=0.6.2",
+    "orbax>=0.1.9",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
