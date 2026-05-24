@@ -90,6 +90,10 @@ data:
   val_hf_subset: ''
   val_hf_text_column: ''
   gen_every: 500
+  gen_prompts:
+    - "The history of artificial intelligence"
+    - "In recent years, researchers have discovered"
+    - "The most important thing to understand about"
   val_every: 500
   val_batches: 16
 checkpoint:

@@ -1174,16 +1174,15 @@ def _verify_learning(
 # Text generation helper for TinyStories learning verification
 # ---------------------------------------------------------------------------
 
-def _generate_text_sample(model: DWAModel, tokenizer, tcfg: TrainConfig, step: int) -> None:
-    """Generate up to 120 tokens from a fixed prompt, stopping at EOS."""
+def _generate_text_sample(model: DWAModel, tokenizer, tcfg: TrainConfig, step: int,
+                          prompts: list[str] | None = None) -> None:
+    """Generate up to 120 tokens from one or more prompts, stopping at EOS."""
     eos = tokenizer.eos_token_id
-    # Prepend BOS so the model sees the same <|endoftext|> it was trained on
-    prompt = "Once upon a time"
-    ids    = [eos] + tokenizer.encode(prompt)
-    out    = generate(model, ids, n_new=120, tcfg=tcfg, eos_token_id=eos)
-    # Decode without the leading BOS
-    text   = tokenizer.decode(out[1:], skip_special_tokens=True)
-    _log(f"\n[DWA] step={step} sample: {text}\n")
+    for prompt in (prompts or ["Once upon a time"]):
+        ids  = [eos] + tokenizer.encode(prompt)
+        out  = generate(model, ids, n_new=120, tcfg=tcfg, eos_token_id=eos)
+        text = tokenizer.decode(out[1:], skip_special_tokens=True)
+        _log(f"\n[DWA] step={step} prompt={prompt!r}: {text}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -2162,7 +2161,7 @@ def train(run_cfg: RunConfig) -> None:
 
         # Text generation — host-0 only (model state is replicated so any host could do it)
         if _IS_HOST0 and tokenizer is not None and (steps_done // gen_every) > (prev_steps // gen_every):
-            _generate_text_sample(model, tokenizer, tcfg, steps_done)
+            _generate_text_sample(model, tokenizer, tcfg, steps_done, run_cfg.data.gen_prompts)
 
         # ── W&B per-window log ────────────────────────────────────────────────
         if window_idx % _wb_log_every == 0:
