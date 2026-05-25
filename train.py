@@ -457,18 +457,138 @@ def _detect_hf_splits(hf_path: str, hf_subset: str = "") -> tuple[str, str | Non
 # Grain data loader — multi-host sharding + exact preemption resume
 # ---------------------------------------------------------------------------
 
-class _HFDataSource:
-    """Grain RandomAccessDataSource wrapping a HuggingFace Dataset (non-streaming)."""
+class HFParquetSource:
+    """
+    Grain RandomAccessDataSource backed by HuggingFace Hub Parquet shards.
 
-    def __init__(self, dataset, text_column: str):
-        self._ds  = dataset
-        self._col = text_column
+    Uses HTTP byte-range requests via HfFileSystem — fetches one row group
+    (~1000 rows, few MB) per cache miss.  No full dataset download required.
+
+    File-level sharding: each host gets every shard_count-th Parquet file
+    (round-robin), so hosts see non-overlapping subsets of the dataset.
+    Grain's IndexSampler then shuffles and repeats within each host's view.
+    """
+
+    def __init__(
+        self,
+        repo_id: str,
+        split: str,
+        text_column: str = "text",
+        hf_subset: str = "",
+        shard_index: int = 0,
+        shard_count: int = 1,
+    ):
+        import bisect as _bisect
+        import threading as _threading
+        import pyarrow.parquet as pq
+        from huggingface_hub import HfFileSystem
+
+        self._bisect   = _bisect
+        self._col      = text_column
+        self._lock     = _threading.Lock()
+        self._cache: dict[tuple, list] = {}
+
+        fs = HfFileSystem()
+        base = f"datasets/{repo_id}"
+        # Try patterns in priority order — handles repos with different layouts:
+        #   1. data/{subset}/{split}-*.parquet  (subset-in-subdir, split prefix)
+        #   2. data/{subset}/*.parquet          (subset-in-subdir, no split prefix)
+        #   3. data/{split}-*.parquet           (flat, split prefix)
+        #   4. data/*.parquet                   (flat, no split prefix)
+        #   5. data/**/*.parquet                (recursive fallback)
+        candidate_patterns = []
+        if hf_subset:
+            candidate_patterns += [
+                f"{base}/data/{hf_subset}/{split}-*.parquet",
+                f"{base}/data/{hf_subset}/*.parquet",
+            ]
+        candidate_patterns += [
+            f"{base}/data/{split}-*.parquet",
+            f"{base}/data/*.parquet",
+            f"{base}/data/**/*.parquet",
+        ]
+        all_paths: list[str] = []
+        for pattern in candidate_patterns:
+            all_paths = sorted(fs.glob(pattern))
+            if all_paths:
+                _log(f"[Grain] HFParquetSource: matched pattern {pattern!r}")
+                break
+        if not all_paths:
+            raise FileNotFoundError(
+                f"No Parquet shards found for {repo_id!r} split={split!r} "
+                f"(subset={hf_subset!r}). Tried: {candidate_patterns}"
+            )
+
+        my_paths = all_paths[shard_index::shard_count]
+        _log(f"[Grain] HFParquetSource: {len(my_paths)}/{len(all_paths)} shards "
+             f"for process {shard_index}/{shard_count}")
+
+        # Footer metadata cache — avoids re-fetching N footer HTTP requests on
+        # every startup.  Keyed by a hash of (repo, subset, split, shard assignment).
+        import hashlib, json
+        _cache_key = hashlib.md5(
+            f"{repo_id}|{hf_subset}|{split}|{shard_index}|{shard_count}".encode()
+        ).hexdigest()
+        _meta_cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "hfparquet")
+        _meta_cache_path = os.path.join(_meta_cache_dir, f"{_cache_key}.json")
+
+        self._fs       = fs
+        self._paths    = my_paths
+        self._pq       = pq
+        self._pf_cache: dict[int, object] = {}   # lazily opened ParquetFile objects
+
+        if os.path.exists(_meta_cache_path):
+            _log(f"[Grain] HFParquetSource: loading footer metadata from cache …")
+            with open(_meta_cache_path) as f:
+                meta = json.load(f)
+            self._rg_starts: list[int] = meta["rg_starts"]
+            self._rg_map:    list[list] = meta["rg_map"]
+            self._total: int            = meta["total"]
+        else:
+            _log(f"[Grain] HFParquetSource: reading {len(my_paths)} Parquet footers "
+                 f"(one-time, will cache) …")
+            self._rg_starts = []
+            self._rg_map    = []
+            total = 0
+            for pf_idx, path in enumerate(my_paths):
+                pf = pq.ParquetFile(fs.open(path))
+                self._pf_cache[pf_idx] = pf
+                for rg in range(pf.num_row_groups):
+                    self._rg_starts.append(total)
+                    self._rg_map.append([pf_idx, rg])
+                    total += pf.metadata.row_group(rg).num_rows
+            self._total = total
+            os.makedirs(_meta_cache_dir, exist_ok=True)
+            with open(_meta_cache_path, "w") as f:
+                json.dump({"rg_starts": self._rg_starts,
+                           "rg_map":    self._rg_map,
+                           "total":     self._total}, f)
+            _log(f"[Grain] HFParquetSource: footer metadata cached → {_meta_cache_path}")
+
+        _log(f"[Grain] HFParquetSource: {self._total:,} total rows  "
+             f"{len(self._rg_map)} row groups")
 
     def __len__(self) -> int:
-        return len(self._ds)
+        return self._total
 
     def __getitem__(self, idx: int) -> str:
-        return self._ds[int(idx)][self._col]
+        rg_pos = self._bisect.bisect_right(self._rg_starts, idx) - 1
+        pf_idx, rg_idx = self._rg_map[rg_pos]
+        row_in_rg = idx - self._rg_starts[rg_pos]
+
+        key = (pf_idx, rg_idx)
+        with self._lock:
+            if key not in self._cache:
+                # Lazily open ParquetFile on first access (avoids 512 HTTP
+                # footer requests at startup — only files actually used are opened)
+                if pf_idx not in self._pf_cache:
+                    self._pf_cache[pf_idx] = self._pq.ParquetFile(
+                        self._fs.open(self._paths[pf_idx])
+                    )
+                # Single HTTP byte-range request for this row group only
+                table = self._pf_cache[pf_idx].read_row_group(rg_idx, columns=[self._col])
+                self._cache[key] = table.column(self._col).to_pylist()
+        return self._cache[key][row_in_rg]
 
 
 class GrainLoader:
@@ -502,7 +622,6 @@ class GrainLoader:
         worker_count: int = 4,
     ):
         import grain.python as grain
-        from datasets import load_dataset
 
         self.tokenizer      = tokenizer
         self.seq_len        = seq_len
@@ -510,18 +629,23 @@ class GrainLoader:
         self._process_index = process_index
         self._process_count = process_count
 
-        _log(f"[Grain] Loading {hf_path!r} split={split!r} for indexed access (process {process_index}/{process_count})…")
-        load_kwargs = {"name": hf_subset} if hf_subset else {}
-        ds = load_dataset(hf_path, split=split, **load_kwargs)
-        self._source = _HFDataSource(ds, text_column)
-        _log(f"[Grain] Dataset: {len(self._source):,} stories  "
-             f"shard {process_index}/{process_count}")
+        # HFParquetSource: byte-range HTTP requests, no full download.
+        # File-level sharding is handled inside HFParquetSource (round-robin by
+        # shard_index/shard_count), so grain.ShardOptions sees shard_count=1.
+        self._source = HFParquetSource(
+            repo_id=hf_path,
+            split=split,
+            text_column=text_column,
+            hf_subset=hf_subset,
+            shard_index=process_index,
+            shard_count=process_count,
+        )
 
         sampler = grain.IndexSampler(
             num_records=len(self._source),
             shard_options=grain.ShardOptions(
-                shard_index=process_index,
-                shard_count=process_count,
+                shard_index=0,
+                shard_count=1,
                 drop_remainder=True,
             ),
             shuffle=True,
@@ -913,8 +1037,20 @@ class StreamingLoader:
         return out.reshape(steps, batch_size, self.seq_len)
 
     def state_dict(self) -> dict:
+        # Wait for any in-flight prefetch: ensures _pf_buf is fully written
+        # and _stories_consumed is stable before we snapshot state.
+        self._pf_event.wait()
+        remaining = self._buf[self._buf_pos:]
+        # Include the already-prefetched buffer so the restored checkpoint has
+        # data from both the current and next fetch batch.  Without this, resume
+        # does skip(stories_consumed) which skips past _pf_buf stories that are
+        # then absent from the restored buf, causing a data gap.
+        if self._pf_buf is not None and len(self._pf_buf):
+            full_buf = np.concatenate([remaining, self._pf_buf], axis=0)
+        else:
+            full_buf = remaining
         return {
-            "buf":              self._buf[self._buf_pos:],
+            "buf":              full_buf,
             "stories_consumed": np.array(self._stories_consumed, dtype=np.int64),
         }
 
@@ -1820,23 +1956,45 @@ def train(run_cfg: RunConfig) -> None:
     _log(f"[DWA] FLOPs/step (fwd+bwd, approx): {step_flops / 1e9:.1f}G"
           f"  (data={data_label})")
 
-    # Data loader — StreamingLoader: no full download, multi-host sharding, background prefetch.
-    # FETCH_SIZE is auto-scaled to cover ≥2 windows per fetch so the background
-    # thread always finishes before the next get_window() call needs data.
+    # Data loader selection:
+    #   "grain"     — GrainLoader: HF Hub Parquet byte-range requests, exact resume
+    #                 via PyGrainCheckpointHandler.  Requires: pip install grain-nightly
+    #   "streaming" — StreamingLoader: HF streaming API, no full download, approximate resume.
     loader = None
     if tokenizer is not None:
-        loader = StreamingLoader(
-            tokenizer, cfg.seq_len,
-            steps_per_window=tcfg.steps_per_window,
-            batch_size=per_host_batch,
-            hf_path=run_cfg.data.hf_path,
-            hf_subset=run_cfg.data.hf_subset,
-            text_column=run_cfg.data.hf_text_column,
-            split=_train_split,
-            process_index=process_index,
-            process_count=process_count,
-            seed=tcfg.seed,
-        )
+        _want_grain = (run_cfg.data.loader == "grain")
+        if _want_grain:
+            try:
+                import grain.python as _grain  # noqa: F401
+                loader = GrainLoader(
+                    tokenizer, cfg.seq_len,
+                    hf_path=run_cfg.data.hf_path,
+                    hf_subset=run_cfg.data.hf_subset,
+                    text_column=run_cfg.data.hf_text_column,
+                    split=_train_split,
+                    process_index=process_index,
+                    process_count=process_count,
+                    seed=tcfg.seed,
+                )
+                _log("[Loader] Using GrainLoader (HF Parquet byte-range, exact resume)")
+            except ImportError:
+                _log("[Loader] grain not installed — falling back to StreamingLoader. "
+                     "Run: pip install grain-nightly")
+                _want_grain = False
+
+        if not _want_grain:
+            loader = StreamingLoader(
+                tokenizer, cfg.seq_len,
+                steps_per_window=tcfg.steps_per_window,
+                batch_size=per_host_batch,
+                hf_path=run_cfg.data.hf_path,
+                hf_subset=run_cfg.data.hf_subset,
+                text_column=run_cfg.data.hf_text_column,
+                split=_train_split,
+                process_index=process_index,
+                process_count=process_count,
+                seed=tcfg.seed,
+            )
 
     # Validation cache — preloaded once, fixed for the entire run.
     # If val_hf_path is set, use it as a separate validation dataset (auto-detect its splits).

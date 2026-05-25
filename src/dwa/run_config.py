@@ -55,6 +55,7 @@ class DataConfig:
     val_hf_path: str = ""        # separate HF dataset for validation (empty = same as hf_path)
     val_hf_subset: str = ""      # subset/config for val dataset (empty = same as hf_subset)
     val_hf_text_column: str = "" # text column for val dataset (empty = same as hf_text_column)
+    loader: str = "streaming"     # "streaming" | "grain"  (grain requires pip install grain-nightly)
     gen_every: int = 100         # generate text sample every N steps (hf/tiny_stories only)
     gen_prompts: list = field(default_factory=lambda: ["Once upon a time"])  # prompts for generation samples
     val_every: int = 500         # compute validation loss every N steps (0 = disabled)
