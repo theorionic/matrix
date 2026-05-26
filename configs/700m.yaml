@@ -100,5 +100,5 @@ data:
 checkpoint:
   dir: '/kaggle/working/matrix/checkpoints'
   every: 2000
-  resume: false
+  resume: true
   keep: 3

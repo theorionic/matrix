@@ -75,6 +75,7 @@ from src.dwa.run_config import (
     load_config, save_config, to_dict,
 )
 from src.dwa.monitor import LossAdaptiveLRController, PoolCollapseDetector
+from src.dwa.parquet_grain_loader import RollingParquetLoader
 from src.dwa.schedule import PhaseScheduler
 from src.dwa.utils import ema_update
 from jax.experimental.multihost_utils import host_local_array_to_global_array
@@ -1499,7 +1500,17 @@ def save_checkpoint(
     if loader is not None:
         step_dir = os.path.join(ckpt_dir, str(steps_done))
         os.makedirs(step_dir, exist_ok=True)
-        if isinstance(loader, StreamingLoader):
+        if isinstance(loader, RollingParquetLoader):
+            # Per-host npz: file_index + grain iterator bytes + packed token buffer
+            state = loader.state_dict()
+            grain_bytes = state["grain_bytes"]
+            np.savez(
+                os.path.join(step_dir, f"loader_state_{process_index}.npz"),
+                file_index=np.array(state["file_index"], dtype=np.int64),
+                grain_bytes=np.frombuffer(grain_bytes, dtype=np.uint8) if grain_bytes else np.empty(0, dtype=np.uint8),
+                buf=state["buf"],
+            )
+        elif isinstance(loader, StreamingLoader):
             # Per-host npz: packed token buffer + approximate stream position
             state = loader.state_dict()
             np.savez(
@@ -1589,7 +1600,7 @@ def load_checkpoint(
             for dev in pool_sharding.addressable_devices:
                 rows = idx_map[dev][0]
                 shard = jax.device_put(
-                    jnp.array(pool_np[rows], dtype=model.pool.vectors[...].dtype), dev
+                    jnp.array(pool_np[rows]).astype(model.pool.vectors[...].dtype), dev
                 )
                 per_dev.append(shard)
             sharded_pool = jax.make_array_from_single_device_arrays(
@@ -1608,7 +1619,7 @@ def load_checkpoint(
             for dev in emb_sharding.addressable_devices:
                 rows = idx_map[dev][0]
                 shard = jax.device_put(
-                    jnp.array(emb_np[rows], dtype=model.pool.embeddings[...].dtype), dev
+                    jnp.array(emb_np[rows]).astype(model.pool.embeddings[...].dtype), dev
                 )
                 per_dev.append(shard)
             sharded_emb = jax.make_array_from_single_device_arrays(
@@ -1644,12 +1655,21 @@ def load_checkpoint(
     grain_dir      = os.path.join(ckpt_dir, f"grain_p{process_index}")
 
     if os.path.exists(streaming_path):
-        # StreamingLoader format: buf + stories_consumed
-        d = np.load(streaming_path)
-        loader_state = {
-            "buf":              d["buf"] if "buf" in d.files else np.empty((0,), dtype=np.int32),
-            "stories_consumed": int(d["stories_consumed"]) if "stories_consumed" in d.files else 0,
-        }
+        d = np.load(streaming_path, allow_pickle=False)
+        if "file_index" in d.files:
+            # RollingParquetLoader format: file_index + grain_bytes + buf
+            raw_bytes = d["grain_bytes"].tobytes() if len(d["grain_bytes"]) > 0 else b""
+            loader_state = {
+                "file_index":  int(d["file_index"]),
+                "grain_bytes": raw_bytes,
+                "buf":         d["buf"] if "buf" in d.files else np.empty((0,), dtype=np.int32),
+            }
+        else:
+            # StreamingLoader format: buf + stories_consumed
+            loader_state = {
+                "buf":              d["buf"] if "buf" in d.files else np.empty((0,), dtype=np.int32),
+                "stories_consumed": int(d["stories_consumed"]) if "stories_consumed" in d.files else 0,
+            }
     elif os.path.isdir(grain_dir) and os.path.exists(buf_path):
         # Grain loader format: restore iterator via PyGrainCheckpointHandler
         try:
@@ -1966,17 +1986,22 @@ def train(run_cfg: RunConfig) -> None:
         if _want_grain:
             try:
                 import grain.python as _grain  # noqa: F401
-                loader = GrainLoader(
+                loader = RollingParquetLoader(
                     tokenizer, cfg.seq_len,
-                    hf_path=run_cfg.data.hf_path,
+                    repo_id=run_cfg.data.hf_path,
+                    split=_train_split,
                     hf_subset=run_cfg.data.hf_subset,
                     text_column=run_cfg.data.hf_text_column,
-                    split=_train_split,
-                    process_index=process_index,
-                    process_count=process_count,
+                    shard_index=process_index,
+                    shard_count=process_count,
                     seed=tcfg.seed,
                 )
-                _log("[Loader] Using GrainLoader (HF Parquet byte-range, exact resume)")
+                s = loader.stats()
+                _log(f"[Loader] RollingParquetLoader ready: "
+                     f"file={s['file_idx']}/{s['n_files']}  "
+                     f"queue={s['queue_size']}/{s['queue_max']}  "
+                     f"buf={s['buf_seqs']:,} seqs  "
+                     f"next_file_ready={s['dl_ready']}")
             except ImportError:
                 _log("[Loader] grain not installed — falling back to StreamingLoader. "
                      "Run: pip install grain-nightly")
@@ -2087,10 +2112,11 @@ def train(run_cfg: RunConfig) -> None:
             model.pool_ema[...] = pool_ema
             start_window = steps_done // tcfg.steps_per_window
             if loader is not None and loader_state is not None:
-                if isinstance(loader, GrainLoader):
-                    loader.set_state(loader_state)
-                else:
-                    loader.load_state_dict(loader_state)
+                loader.load_state_dict(loader_state)
+                if isinstance(loader, RollingParquetLoader):
+                    s = loader.stats()
+                    _log(f"[Loader] Resumed: file={s['file_idx']}/{s['n_files']}  "
+                         f"buf={s['buf_seqs']:,} seqs")
             _log(f"[Ckpt] Resuming from step {steps_done} (window {start_window}/{n_windows})")
         else:
             _log(f"[Ckpt] No checkpoint in '{ckpt_dir}', starting fresh.")
@@ -2229,6 +2255,15 @@ def train(run_cfg: RunConfig) -> None:
             f"tok/s={win_tok_per_sec:,}  TFLOP/s={achieved_tflops:.1f}"
             + ("  [compile]" if is_compile_win else "")
         )
+        # Loader health — every 10 windows so it's visible but not spammy
+        if isinstance(loader, RollingParquetLoader) and window_idx % 10 == 0:
+            s = loader.stats()
+            stall = "" if s["queue_size"] > 0 else "  ⚠ queue empty"
+            _log(f"[Loader] file={s['file_idx']}/{s['n_files']}  "
+                 f"queue={s['queue_size']}/{s['queue_max']}  "
+                 f"buf={s['buf_seqs']:,} seqs  "
+                 f"next_dl={'ready' if s['dl_ready'] else 'downloading'}"
+                 f"{stall}")
 
         # ── Safety checks ────────────────────────────────────────────────────
 
