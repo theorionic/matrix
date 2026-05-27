@@ -1556,6 +1556,24 @@ def _abstract_like(item):
     return jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, item)
 
 
+def _orbax_to_numpy(arr: np.ndarray) -> np.ndarray:
+    """Convert void-dtype arrays that orbax uses for bfloat16 storage to ml_dtypes.bfloat16.
+
+    Orbax serialises bfloat16 arrays as numpy |V2 (2-byte void) because numpy has
+    no native bfloat16 dtype.  JAX rejects |V2 outright, so we reinterpret the
+    raw bytes via ml_dtypes.bfloat16 (a numpy-compatible extension type that JAX
+    accepts).  Any other dtype is returned unchanged.
+    """
+    if arr.dtype.kind == 'V':
+        import ml_dtypes as _mld
+        itemsize = arr.dtype.itemsize
+        if itemsize == 2:
+            return arr.view(_mld.bfloat16)
+        # Fallback for other void sizes: view as unsigned int of same width
+        return arr.view(np.dtype(f'u{itemsize}'))
+    return arr
+
+
 def load_checkpoint(
     ckpt_dir: str,
     steps_done_target: int,
@@ -1603,7 +1621,7 @@ def load_checkpoint(
         if "vectors" in restored["model"]["pool"]:
             # Re-shard pool vectors without materialising the full array on one device:
             # slice each device's rows and put them directly.
-            pool_np  = np.array(restored["model"]["pool"]["vectors"])  # host numpy [N, D]
+            pool_np  = _orbax_to_numpy(np.array(restored["model"]["pool"]["vectors"]))
             N_local  = pool_np.shape[0] // n_model
             idx_map  = pool_sharding.addressable_devices_indices_map(pool_np.shape)
             per_dev  = []
@@ -1621,7 +1639,7 @@ def load_checkpoint(
             model.pool.vectors[...] = sharded_pool
         elif "embeddings" in restored["model"]["pool"]:
             # Re-shard coordinate embeddings without materialising the full array on one device:
-            emb_np  = np.array(restored["model"]["pool"]["embeddings"])  # host numpy [N, d_emb]
+            emb_np  = _orbax_to_numpy(np.array(restored["model"]["pool"]["embeddings"]))
             N_local  = emb_np.shape[0] // n_model
             emb_sharding = NamedSharding(mesh, P("model", None))
             idx_map  = emb_sharding.addressable_devices_indices_map(emb_np.shape)
