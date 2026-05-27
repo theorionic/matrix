@@ -102,3 +102,10 @@ checkpoint:
   every: 2000
   resume: true
   keep: 3
+gdrive:
+  enabled: true
+  rclone_remote: gdrive
+  remote_path: checkpoints-dwa
+  push_on_save: true
+  pull_on_resume: true
+  rclone_args: "--transfers 4"
