@@ -1460,6 +1460,7 @@ def save_checkpoint(
     loader,
     keep: int = 3,
     process_index: int = 0,
+    lr_scale: float = 1.0,
 ) -> None:
     """
     Save a full training checkpoint (multi-host aware).
@@ -1539,6 +1540,14 @@ def save_checkpoint(
                 save_kwargs["cursor"] = np.array(state["cursor"], dtype=np.int32)
             np.savez(loader_path, **save_kwargs)
 
+    # Save adaptive LR scale alongside the checkpoint (host-0 only, plain text).
+    # Used on resume to prevent the adaptive controller from restarting at 1.0
+    # after a preemption, which caused oscillating effective LR in prior runs.
+    if process_index == 0:
+        lr_scale_path = os.path.join(ckpt_dir, str(steps_done), "lr_scale.txt")
+        with open(lr_scale_path, "w") as _f:
+            _f.write(str(lr_scale))
+
     _log(f"[Ckpt] Saved step {steps_done} → {ckpt_dir}/{steps_done}/")
 
 
@@ -1555,7 +1564,7 @@ def load_checkpoint(
     cfg: DWAConfig,
     mesh,
     process_index: int = 0,
-) -> tuple[int, jax.Array, dict | None]:
+) -> tuple[int, jax.Array, dict | None, jnp.ndarray, float]:
     """
     Restore model, optimizer, and metadata from a checkpoint (multi-host aware).
 
@@ -1563,7 +1572,8 @@ def load_checkpoint(
     Loader state is loaded per-host (grain_state_{pid}.bin + loader_buf_{pid}.npz),
     with fallback to the legacy loader_state.npz format.
 
-    Returns (steps_done, rng, loader_state_dict, pool_ema).
+    Returns (steps_done, rng, loader_state_dict, pool_ema, lr_scale).
+    lr_scale is the saved adaptive LR controller multiplier (1.0 if not found in checkpoint).
     """
     mngr = _get_ckpt_manager(ckpt_dir)
 
@@ -1692,8 +1702,19 @@ def load_checkpoint(
             buf = np.load(buf_npy) if os.path.exists(buf_npy) else np.empty((0,), dtype=np.int32)
             loader_state = {"buf": buf}
 
+    # Restore adaptive LR scale (written by host-0; all hosts read same value).
+    # Falls back to 1.0 for old checkpoints that predate this field.
+    lr_scale_path = os.path.join(ckpt_dir, str(steps_done_target), "lr_scale.txt")
+    saved_lr_scale = 1.0
+    if os.path.exists(lr_scale_path):
+        try:
+            with open(lr_scale_path) as _f:
+                saved_lr_scale = float(_f.read().strip())
+        except (ValueError, OSError):
+            saved_lr_scale = 1.0
+
     _log(f"[Ckpt] Loaded step {steps_done} from {ckpt_dir}/{steps_done_target}/")
-    return steps_done, rng, loader_state, pool_ema
+    return steps_done, rng, loader_state, pool_ema, saved_lr_scale
 
 
 # ---------------------------------------------------------------------------
@@ -2105,7 +2126,7 @@ def train(run_cfg: RunConfig) -> None:
         mngr_probe = _get_ckpt_manager(ckpt_dir)
         latest = mngr_probe.latest_step()
         if latest is not None:
-            steps_done, rng, loader_state, pool_ema = load_checkpoint(
+            steps_done, rng, loader_state, pool_ema, _ckpt_lr_scale = load_checkpoint(
                 ckpt_dir, latest, model, optimizer, cfg, mesh,
                 process_index=process_index,
             )
@@ -2117,7 +2138,14 @@ def train(run_cfg: RunConfig) -> None:
                     s = loader.stats()
                     _log(f"[Loader] Resumed: file={s['file_idx']}/{s['n_files']}  "
                          f"buf={s['buf_seqs']:,} seqs")
-            _log(f"[Ckpt] Resuming from step {steps_done} (window {start_window}/{n_windows})")
+            # Restore adaptive LR scale and rebuild optimizer.tx to match.
+            # For checkpoints written before lr_scale was added (old format), fall
+            # back to 1.0 so the cosine schedule alone controls the LR magnitude.
+            _current_lr_scale = _ckpt_lr_scale
+            if abs(_current_lr_scale - 1.0) > 1e-4:
+                optimizer.tx = _build_tx(model, tcfg, scheduler, _current_lr_scale)
+            _log(f"[Ckpt] Resuming from step {steps_done} (window {start_window}/{n_windows})"
+                 f"  lr_scale={_current_lr_scale:.4f}")
         else:
             _log(f"[Ckpt] No checkpoint in '{ckpt_dir}', starting fresh.")
 
@@ -2401,6 +2429,7 @@ def train(run_cfg: RunConfig) -> None:
             save_checkpoint(
                 ckpt_dir, model, optimizer, pool_ema, steps_done, rng, loader,
                 process_index=process_index,
+                lr_scale=_current_lr_scale,
             )
             if _IS_HOST0:
                 cfg_out = os.path.join(ckpt_dir, "effective_config.yaml")

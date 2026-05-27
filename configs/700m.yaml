@@ -53,7 +53,7 @@ train:
   total_steps: 150000
   lambda_gate_start: 1.0
   lambda_gate_end: 3.0
-  lambda_sharpen_end: 10.0
+  lambda_sharpen_end: 6.0
   gate_ramp_steps: 500
   lambda_util: 0.0002   # was 1.0: N=65536 makes l_util range [1, 65536]; 0.0002 keeps penalty <10% of task_loss
   lambda_reuse: 0.01    # was 0.5: gradient bounded at 1/1e-4=10^4 by clip in losses.py; 0.01 keeps it mild
@@ -65,7 +65,7 @@ train:
   lr_parts: 5.0e-05     # lower for bigger transformer
   lr_retrieval: 5.0e-05
   lr_threshold: 5.0e-04
-  lr_min_scale: 1.0
+  lr_min_scale: 0.05
   batch_size: 64
   steps_per_window: 100  # fewer steps per window; each step is ~5× more expensive
   seed: 42
@@ -76,8 +76,8 @@ train:
   loss_spike_sigma: 5.0
   dead_vector_threshold: 1.0e-06
   revival_interval_steps: 100   # was 250: more frequent but smaller revival batches
-  max_revival_frac: 0.02        # cap: revive at most 2% of pool (≤1310 vectors) per event
-  revival_noise_factor: 0.02    # was 0.2: 10x smaller noise reduces parameter perturbation
+  max_revival_frac: 0.05        # cap: revive at most 5% of pool (≤3276 vectors) per event
+  revival_noise_factor: 0.1     # enough noise to diversify revived vector keys from donors
 sharding:
   n_model: 2            # explicit: 2-way model parallel (pool sharded), 4-way data parallel
 data:
