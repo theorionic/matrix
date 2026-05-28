@@ -87,6 +87,7 @@ from jax.experimental.multihost_utils import host_local_array_to_global_array
 
 _IS_HOST0: bool = True                # set to False on workers after _init_distributed()
 _DISTRIBUTED_INITIALIZED: bool = False
+_ckpt_bg_thread: "threading.Thread | None" = None
 
 
 def _init_distributed() -> tuple[int, int]:
@@ -1450,6 +1451,27 @@ def _get_grain_ckpt_manager(ckpt_dir: str, process_index: int,
     )
 
 
+def _take_ckpt_snapshot(model, optimizer, pool_ema, rng, loader) -> dict:
+    """Extract all mutable training state to pure numpy. Must be called synchronously."""
+    model_np = jax.tree_util.tree_map(np.array, nnx.state(model, nnx.Param))
+    opt_leaves, _ = jax.tree_util.tree_flatten(optimizer.opt_state)
+    opt_dict = {f"{i:04d}": np.array(leaf) for i, leaf in enumerate(opt_leaves)}
+    snap: dict = {
+        "model_np": model_np,
+        "opt_dict": opt_dict,
+        "opt_step": int(optimizer.step[...]),
+        "pool_ema": np.array(pool_ema, dtype=np.float32),
+        "rng":      np.array(rng),
+    }
+    if loader is not None:
+        if isinstance(loader, GrainLoader):
+            snap["grain_it"]  = loader._it          # grain serializes state at save() time
+            snap["grain_buf"] = loader._buf[loader._buf_pos:].copy()
+        else:
+            snap["loader_state"] = loader.state_dict()
+    return snap
+
+
 def save_checkpoint(
     ckpt_dir: str,
     model: DWAModel,
@@ -1461,6 +1483,7 @@ def save_checkpoint(
     keep: int = 3,
     process_index: int = 0,
     lr_scale: float = 1.0,
+    _snapshot: "dict | None" = None,
 ) -> None:
     """
     Save a full training checkpoint (multi-host aware).
@@ -1478,18 +1501,28 @@ def save_checkpoint(
     """
     mngr = _get_ckpt_manager(ckpt_dir, keep)
 
-    model_np = jax.tree_util.tree_map(np.array, nnx.state(model, nnx.Param))
-    opt_leaves, _ = jax.tree_util.tree_flatten(optimizer.opt_state)
-    opt_dict = {f"{i:04d}": np.array(leaf) for i, leaf in enumerate(opt_leaves)}
+    if _snapshot is not None:
+        model_np = _snapshot["model_np"]
+        opt_dict = _snapshot["opt_dict"]
+        _opt_step = _snapshot["opt_step"]
+        _pool_ema = _snapshot["pool_ema"]
+        _rng      = _snapshot["rng"]
+    else:
+        model_np = jax.tree_util.tree_map(np.array, nnx.state(model, nnx.Param))
+        opt_leaves, _ = jax.tree_util.tree_flatten(optimizer.opt_state)
+        opt_dict = {f"{i:04d}": np.array(leaf) for i, leaf in enumerate(opt_leaves)}
+        _opt_step = int(optimizer.step[...])
+        _pool_ema = np.array(pool_ema, dtype=np.float32)
+        _rng      = np.array(rng)
 
     save_item = {
         "model": model_np,
         "opt":   opt_dict,
         "meta": {
-            "opt_step":   np.array(int(optimizer.step[...]), dtype=np.int32),
-            "pool_ema":   np.array(pool_ema, dtype=np.float32),
+            "opt_step":   np.array(_opt_step, dtype=np.int32),
+            "pool_ema":   _pool_ema,
             "steps_done": np.array(steps_done, dtype=np.int32),
-            "rng":        np.array(rng),
+            "rng":        _rng,
         },
     }
 
@@ -1503,7 +1536,7 @@ def save_checkpoint(
         os.makedirs(step_dir, exist_ok=True)
         if isinstance(loader, RollingParquetLoader):
             # Per-host npz: file_index + grain iterator bytes + packed token buffer
-            state = loader.state_dict()
+            state = _snapshot["loader_state"] if _snapshot else loader.state_dict()
             grain_bytes = state["grain_bytes"]
             np.savez(
                 os.path.join(step_dir, f"loader_state_{process_index}.npz"),
@@ -1513,7 +1546,7 @@ def save_checkpoint(
             )
         elif isinstance(loader, StreamingLoader):
             # Per-host npz: packed token buffer + approximate stream position
-            state = loader.state_dict()
+            state = _snapshot["loader_state"] if _snapshot else loader.state_dict()
             np.savez(
                 os.path.join(step_dir, f"loader_state_{process_index}.npz"),
                 buf=state["buf"],
@@ -1523,17 +1556,19 @@ def save_checkpoint(
             # 1. Grain iterator position via PyGrainCheckpointHandler (atomic, orbax-managed)
             import grain.python as grain
             grain_mngr = _get_grain_ckpt_manager(ckpt_dir, process_index, keep)
+            _grain_it  = _snapshot["grain_it"] if _snapshot else loader._it
             grain_mngr.save(
                 steps_done,
-                args=ocp.args.Composite(grain=grain.PyGrainCheckpointSave(loader._it)),
+                args=ocp.args.Composite(grain=grain.PyGrainCheckpointSave(_grain_it)),
             )
             grain_mngr.wait_until_finished()
             # 2. Remaining packed token buffer (not tracked by grain — saved alongside)
-            buf_path = os.path.join(step_dir, f"loader_buf_{process_index}.npz")
-            np.savez(buf_path, buf=loader._buf[loader._buf_pos:].copy())
+            buf_path  = os.path.join(step_dir, f"loader_buf_{process_index}.npz")
+            _grain_buf = _snapshot["grain_buf"] if _snapshot else loader._buf[loader._buf_pos:].copy()
+            np.savez(buf_path, buf=_grain_buf)
         elif process_index == 0:
             # TinyStoriesLoader: only host 0 (backward compat)
-            state = loader.state_dict()
+            state = _snapshot["loader_state"] if _snapshot else loader.state_dict()
             loader_path = os.path.join(step_dir, "loader_state.npz")
             save_kwargs = {"buf": state["buf"]}
             if "cursor" in state:
@@ -2441,29 +2476,52 @@ def train(run_cfg: RunConfig) -> None:
                 "perf/is_compile":      int(is_compile_win),
             }, step=steps_done)
 
-        # Checkpoint save — ALL hosts call this (orbax coordinates JAX array shards).
-        # Non-JAX side effects (config dump) are host-0 only.
+        # Checkpoint save — snapshot mutable state synchronously, then write in background.
+        # Non-JAX side effects (config dump, rclone push) are host-0 only.
         if ckpt_dir and ckpt_every > 0 and (steps_done // ckpt_every) > (prev_steps // ckpt_every):
-            save_checkpoint(
-                ckpt_dir, model, optimizer, pool_ema, steps_done, rng, loader,
-                process_index=process_index,
-                lr_scale=_current_lr_scale,
-            )
+            global _ckpt_bg_thread
+            snap = _take_ckpt_snapshot(model, optimizer, pool_ema, rng, loader)
+            _ckpt_dir        = ckpt_dir
+            _ckpt_steps      = steps_done
+            _ckpt_proc       = process_index
+            _ckpt_lr_scale   = _current_lr_scale
+            _ckpt_keep       = run_cfg.checkpoint.keep if hasattr(run_cfg.checkpoint, "keep") else 3
+            _do_gdrive       = (_IS_HOST0 and gdrive_cfg.enabled
+                                and gdrive_cfg.push_on_save and gdrive_cfg.remote_path)
+            _gdrive_remote   = gdrive_cfg.rclone_remote
+            _gdrive_path     = gdrive_cfg.remote_path
+            _gdrive_args     = gdrive_cfg.rclone_args
+
+            if _ckpt_bg_thread is not None and _ckpt_bg_thread.is_alive():
+                _log("[Ckpt] Waiting for previous background checkpoint to finish …")
+                _ckpt_bg_thread.join()
+
+            def _bg_ckpt():
+                save_checkpoint(
+                    _ckpt_dir, model, optimizer, pool_ema, _ckpt_steps, rng, loader,
+                    keep=_ckpt_keep,
+                    process_index=_ckpt_proc,
+                    lr_scale=_ckpt_lr_scale,
+                    _snapshot=snap,
+                )
+                if _do_gdrive:
+                    _rclone_push(_ckpt_dir, _gdrive_remote, _gdrive_path, extra_args=_gdrive_args)
+
             if _IS_HOST0:
                 cfg_out = os.path.join(ckpt_dir, "effective_config.yaml")
                 if not os.path.exists(cfg_out):
                     save_config(run_cfg, cfg_out)
-                if (gdrive_cfg.enabled and gdrive_cfg.push_on_save
-                        and gdrive_cfg.remote_path):
-                    _rclone_push(
-                        ckpt_dir,
-                        gdrive_cfg.rclone_remote,
-                        gdrive_cfg.remote_path,
-                        extra_args=gdrive_cfg.rclone_args,
-                    )
+
+            _ckpt_bg_thread = threading.Thread(target=_bg_ckpt, daemon=True, name="ckpt-bg")
+            _ckpt_bg_thread.start()
+            _log(f"[Ckpt] Background save started for step {steps_done}.")
 
         # Update model's pool EMA (non-trainable variable)
         model.pool_ema[...] = pool_ema
+
+    if _ckpt_bg_thread is not None and _ckpt_bg_thread.is_alive():
+        _log("[Ckpt] Waiting for final background checkpoint to finish …")
+        _ckpt_bg_thread.join()
 
     elapsed_total = time.time() - t0
     _log(f"[DWA] Training complete in {elapsed_total:.1f}s")
