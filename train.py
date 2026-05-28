@@ -2194,9 +2194,9 @@ def train(run_cfg: RunConfig) -> None:
             # Restore adaptive LR scale and rebuild optimizer.tx to match.
             # For checkpoints written before lr_scale was added (old format), fall
             # back to 1.0 so the cosine schedule alone controls the LR magnitude.
-            _current_lr_scale = _ckpt_lr_scale
-            if abs(_current_lr_scale - 1.0) > 1e-4:
-                optimizer.tx = _build_tx(model, tcfg, scheduler, _current_lr_scale)
+            _current_lr_scale = 1.0  # plateau reducer disabled; ignore saved scale
+            if abs(_ckpt_lr_scale - 1.0) > 1e-4:
+                _log(f"[Ckpt] Ignoring saved lr_scale={_ckpt_lr_scale:.4f} (plateau reducer disabled)")
             _log(f"[Ckpt] Resuming from step {steps_done} (window {start_window}/{n_windows})"
                  f"  lr_scale={_current_lr_scale:.4f}")
         else:
@@ -2256,7 +2256,7 @@ def train(run_cfg: RunConfig) -> None:
     # rebuilt with a new lr_scale multiplier (Adam M/V moments are preserved
     # since they are LR-independent; only the schedule magnitude changes).
     collapse_detector = PoolCollapseDetector(cfg.N, cfg.k_max)
-    lr_ctrl           = LossAdaptiveLRController()
+    lr_ctrl           = LossAdaptiveLRController(floor=1.0)
     _current_lr_scale  = 1.0   # tracks the live scale for log display
 
     t0 = time.time()
