@@ -310,6 +310,10 @@ class LossAdaptiveLRController:
                     self._cooldown    = self.cooldown
                     self._no_improve  = 0
                     self._n_reductions += 1
+                else:
+                    # floor prevents reduction — clamp counter so it doesn't
+                    # overflow past patience and produce misleading "80/6" display
+                    self._no_improve = self.patience
 
         elif is_improving:
             self._no_improve = 0
