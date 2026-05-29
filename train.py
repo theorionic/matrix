@@ -316,10 +316,15 @@ def _fsdp_shard_params(model: "DWAModel", mesh: "Mesh") -> None:
             spec[-1] = "model"
             return jax.device_put(arr, NamedSharding(mesh, P(*spec)))
             
-        # Transformer: cast to bf16 (cheaper comm + memory), then shard.
+        # Transformer: cast to bf16 (cheaper comm + memory), then shard or replicate.
         if "part_a" in pstr or "part_b" in pstr:
             if arr.dtype == jnp.float32:
                 arr = arr.astype(jnp.bfloat16)
+            
+            if not model.cfg.shard_transformer:
+                if arr.ndim >= 2:
+                    return jax.device_put(arr, NamedSharding(mesh, P(None, None)))
+                return jax.device_put(arr, NamedSharding(mesh, P(None)))
                 
             if arr.ndim >= 2:
                 if use_megatron:
