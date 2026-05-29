@@ -82,6 +82,7 @@ class MultiAspectRetrieval(nnx.Module):
             mesh is not None
             and "model" in mesh.axis_names
             and mesh.shape["model"] > 1
+            and cfg.shard_pool
         )
         use_ivf_now = cfg.use_ivf and not model_sharded
 

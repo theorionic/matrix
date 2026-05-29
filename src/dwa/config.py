@@ -50,6 +50,7 @@ class DWAConfig:
     use_flash_attn: bool = False  # Pallas flash attention (hits VMEM limit inside scan+vjp; inference-only)
     vocab_parallel: bool = True   # shard lm_head across model axis — avoids materialising full [B,T,V] logits
     shard_transformer: bool = True  # shard Part A and Part B across model axis; set False to replicate transformer
+    shard_pool: bool = True        # shard pool vectors across model axis; set False to replicate pool
 
     # Hypernetwork pool generator (swapping memory bandwidth for compute)
     use_hypernetwork: bool = False

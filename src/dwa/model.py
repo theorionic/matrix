@@ -191,6 +191,7 @@ class DWAModel(nnx.Module):
             mesh is not None
             and "model" in mesh.axis_names
             and mesh.shape["model"] > 1
+            and self.pool.cfg.shard_pool
         )
         # Assembly — Pallas kernel keeps W in VMEM; falls back to pure JAX
         W_base = self.assembler.W_base[...]
@@ -247,10 +248,16 @@ class DWAModel(nnx.Module):
                 # instead of D, reducing HBM bandwidth by D/s3 (1.3–3.6× at configs).
                 from .assembly_pallas import split_pool_gather
                 gathered = split_pool_gather(pool_vecs, indices, cfg.d_B, cfg.r, cfg.d_A)
-                h_mid_no_ln, W = pallas_assemble(
-                    gathered, alphas, h_A, W_base, b_base, gamma,
-                    cfg.d_B, cfg.r, cfg.d_A,
-                )
+                if mesh is not None:
+                    h_mid_no_ln, W = shard_pallas_assemble(
+                        gathered, alphas, h_A, W_base, b_base, gamma,
+                        cfg.d_B, cfg.r, cfg.d_A, mesh,
+                    )
+                else:
+                    h_mid_no_ln, W = pallas_assemble(
+                        gathered, alphas, h_A, W_base, b_base, gamma,
+                        cfg.d_B, cfg.r, cfg.d_A,
+                    )
             else:
                 # CPU / no-Pallas: fused gather+assembly — split gather avoids [B,k,D]
                 pool_vecs = self.pool.vectors[...].astype(jnp.float32)

@@ -209,12 +209,14 @@ def _select_n_model(cfg: DWAConfig, n_devices: int, override: int | str = "auto"
 
 def _build_mesh(devices, n_model: int) -> "Mesh":
     """
-    2D Mesh with axes ('data', 'model').
+    Mesh with axes ('data', 'model'). Returns a 1D ('data',) mesh if n_model <= 1.
 
     n_data = n_devices // n_model devices replicate the batch;
     n_model devices share the pool parameter matrix.
     """
     n_devices = len(devices)
+    if n_model <= 1:
+        return Mesh(np.array(devices), ("data",))
     n_data = n_devices // n_model
     devices_2d = np.array(devices).reshape(n_data, n_model)
     return Mesh(devices_2d, ("data", "model"))
@@ -232,7 +234,7 @@ def _make_sharded_pool_vectors(cfg: "DWAConfig", mesh: "Mesh", rng) -> "jnp.ndar
     everything on device 0 and tried to shard afterwards.
     """
     n_model = mesh.shape.get("model", 1)
-    if n_model <= 1:
+    if n_model <= 1 or not cfg.shard_pool:
         return None
 
     N_local = cfg.N // n_model
@@ -496,6 +498,7 @@ def _make_train_window(cfg: DWAConfig, tcfg: TrainConfig, is_warmup: bool, aux_o
             mesh is not None
             and "model" in mesh.axis_names
             and mesh.shape["model"] > 1
+            and cfg.shard_pool
         )
         if cfg.use_ivf and not model_sharded:
             key_cache_new = compute_key_cache(
