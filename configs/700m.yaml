@@ -46,7 +46,7 @@ model:
   use_flash_attn: false
   vocab_parallel: true
   # Hypernetwork pool settings
-  use_hypernetwork: true
+  use_hypernetwork: false
 train:
   warmup_steps: 500
   gate_on_steps: 5000
@@ -66,8 +66,8 @@ train:
   lr_retrieval: 5.0e-05
   lr_threshold: 5.0e-04
   lr_min_scale: 0.05
-  batch_size: 64
-  steps_per_window: 100  # fewer steps per window; each step is ~5× more expensive
+  batch_size: 32        # optimized to 32 to prevent TPU OOM in dense pool mode
+  steps_per_window: 100  # standard window size
   seed: 42
   lr_warmup_steps: 1000
   ema_decay: 0.99
