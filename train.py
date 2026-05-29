@@ -258,6 +258,111 @@ def _make_sharded_pool_vectors(cfg: "DWAConfig", mesh: "Mesh", rng) -> "jnp.ndar
     )
 
 
+def _fsdp_shard_params(model: "DWAModel", mesh: "Mesh") -> None:
+    """
+    Lay out the non-pool parameters for fast training in place.
+
+    Implements clean head-parallel (Megatron-style) attention sharding:
+      - Wq, Wk, Wv: Column-parallel (sharded on output axis) if divisible.
+      - Wo: Row-parallel (sharded on input axis).
+      - W1: Column-parallel.
+      - W2: Row-parallel.
+    This reduces communication to exactly 1 all-reduce (psum) per attention block
+    and 1 all-reduce per FFN block, with no intermediate activation reshards.
+    
+    lm_head stays sharded (P(None, "model")) to match the vocab-parallel CE.
+    """
+    n_model = mesh.shape.get("model", 1)
+    if n_model <= 1:
+        return
+
+    # Check head divisibility for Megatron TP
+    n_heads = model.cfg.n_heads
+    if n_heads % n_model != 0:
+        import warnings
+        warnings.warn(
+            f"n_heads={n_heads} is not divisible by n_model={n_model}. "
+            f"Megatron head-parallel attention sharding requires divisibility. "
+            f"Falling back to original naive largest-axis sharding which may "
+            f"cause excessive activation reshards and slow down training."
+        )
+        use_megatron = False
+    else:
+        use_megatron = True
+
+    def _key_str(k) -> str:
+        return str(getattr(k, "key", k))
+
+    def _shard_on_largest_axis(arr):
+        shp = arr.shape
+        cand = [ax for ax in range(arr.ndim) if shp[ax] % n_model == 0]
+        if not cand:
+            return arr  # no divisible axis → leave replicated
+        ax = max(cand, key=lambda a: shp[a])
+        spec = [None] * arr.ndim
+        spec[ax] = "model"
+        return jax.device_put(arr, NamedSharding(mesh, P(*spec)))
+
+    def _map_leaf(path, arr):
+        if not hasattr(arr, "shape"):
+            return arr
+        pstr = "/".join(_key_str(k) for k in path)
+        if "pool" in pstr or "assembler" in pstr:
+            return arr  # pool already sharded; assembler feeds replicated shard_maps
+        
+        # lm_head: shard the vocab axis to match the vocab-parallel CE constraint.
+        if "lm_head" in pstr and arr.ndim >= 2 and arr.shape[-1] % n_model == 0:
+            spec = [None] * arr.ndim
+            spec[-1] = "model"
+            return jax.device_put(arr, NamedSharding(mesh, P(*spec)))
+            
+        # Transformer: cast to bf16 (cheaper comm + memory), then shard.
+        if "part_a" in pstr or "part_b" in pstr:
+            if arr.dtype == jnp.float32:
+                arr = arr.astype(jnp.bfloat16)
+                
+            if arr.ndim >= 2:
+                if use_megatron:
+                    # 1. Attention Column-parallel
+                    if any(x in pstr for x in ["attn/Wq/kernel", "attn/Wk/kernel", "attn/Wv/kernel"]):
+                        if "attn/Wk" in pstr or "attn/Wv" in pstr:
+                            if model.cfg.n_kv_heads % n_model == 0:
+                                spec = P(None, "model")
+                            else:
+                                spec = P(None, None)  # Replicated to avoid KV all-to-all
+                        else:
+                            spec = P(None, "model")
+                        return jax.device_put(arr, NamedSharding(mesh, spec))
+                    
+                    # 2. Attention Row-parallel
+                    if "attn/Wo/kernel" in pstr:
+                        spec = P("model", None)
+                        return jax.device_put(arr, NamedSharding(mesh, spec))
+                    
+                    # 3. FFN Column-parallel
+                    if "ffn/W1/kernel" in pstr:
+                        spec = P(None, "model")
+                        return jax.device_put(arr, NamedSharding(mesh, spec))
+                    
+                    # 4. FFN Row-parallel
+                    if "ffn/W2/kernel" in pstr:
+                        spec = P("model", None)
+                        return jax.device_put(arr, NamedSharding(mesh, spec))
+                    
+                    # Fallback for any other 2D param: replicated
+                    return jax.device_put(arr, NamedSharding(mesh, P(None, None)))
+                else:
+                    # Naive fallback
+                    return _shard_on_largest_axis(arr)
+                    
+            return arr  # 1-D norms: bf16, replicated
+        return arr
+
+    state = nnx.state(model, nnx.Param)
+    new_state = jax.tree_util.tree_map_with_path(_map_leaf, state)
+    nnx.update(model, new_state)
+
+
 # ---------------------------------------------------------------------------
 # MFU helpers
 # ---------------------------------------------------------------------------
@@ -314,10 +419,14 @@ def _make_train_window(cfg: DWAConfig, tcfg: TrainConfig, is_warmup: bool, aux_o
     ) -> tuple[DWAModel, nnx.Optimizer, jnp.ndarray, dict]:
 
         # --- KEY CACHE: compute once here, reuse for all steps in this window ---
+        # Keep both operands in the pool's native (bf16) dtype so XLA does NOT
+        # materialise a full [N, D] float32 copy of the pool (~2 GB/device at
+        # n_model=4) — the MXU accumulates bf16·bf16 in f32 internally.  Only
+        # the small [S, N, d_k] result is promoted to float32 for retrieval.
         key_cache = compute_key_cache(
-            model.pool.vectors[...].astype(jnp.float32),
-            model.pool.key_proj[...].astype(jnp.float32),
-        )  # [S, N, d_k] — stays in HBM across the scan
+            model.pool.vectors[...],
+            model.pool.key_proj[...],
+        ).astype(jnp.float32)  # [S, N, d_k] — stays in HBM across the scan
 
         def step_fn(carry, xs):
             model, optimizer, pool_ema, step_in_window = carry
@@ -1342,6 +1451,28 @@ def _check_nan_params(model: DWAModel) -> tuple[bool, str]:
     return False, ""
 
 
+def _reshard_from_host(np_arr: "np.ndarray", sharding, dtype) -> "jnp.ndarray":
+    """
+    Place a host numpy array onto `sharding` WITHOUT staging the whole array on
+    one device first.
+
+    `jnp.array(big_arr)` followed by `device_put(..., sharding)` materialises the
+    full array (e.g. the 4 GB pool) on device 0 before resharding — which OOMs
+    mid-training when only ~2 GB is free.  Instead we slice per device on the
+    host and assemble the global array from single-device shards, so no device
+    ever holds more than its own shard.  Falls back to a plain put when the
+    array is unsharded/replicated.
+    """
+    if sharding is None:
+        return jnp.array(np_arr, dtype=dtype)
+    idx_map = sharding.addressable_devices_indices_map(np_arr.shape)
+    shards = []
+    for dev in sharding.addressable_devices:
+        sl = idx_map[dev]
+        shards.append(jax.device_put(jnp.asarray(np_arr[sl], dtype=dtype), dev))
+    return jax.make_array_from_single_device_arrays(np_arr.shape, sharding, shards)
+
+
 def _revive_dead_vectors(
     model: DWAModel,
     pool_ema: jnp.ndarray,
@@ -1393,11 +1524,8 @@ def _revive_dead_vectors(
         emb_np[dead_idx] = emb_np[chosen_donors] + noise
 
         orig_arr = model.pool.embeddings[...]
-        new_jax  = jnp.array(emb_np, dtype=orig_arr.dtype)
         orig_sharding = getattr(orig_arr, "sharding", None)
-        if orig_sharding is not None:
-            new_jax = jax.device_put(new_jax, orig_sharding)
-        model.pool.embeddings[...] = new_jax
+        model.pool.embeddings[...] = _reshard_from_host(emb_np, orig_sharding, orig_arr.dtype)
     else:
         # Standard pool revival
         pool_np  = np.array(model.pool.vectors[...], dtype=np.float32)
@@ -1407,11 +1535,8 @@ def _revive_dead_vectors(
         pool_np[dead_idx] = pool_np[chosen_donors] + noise
 
         orig_arr = model.pool.vectors[...]
-        new_jax  = jnp.array(pool_np, dtype=orig_arr.dtype)
         orig_sharding = getattr(orig_arr, "sharding", None)
-        if orig_sharding is not None:
-            new_jax = jax.device_put(new_jax, orig_sharding)
-        model.pool.vectors[...] = new_jax
+        model.pool.vectors[...] = _reshard_from_host(pool_np, orig_sharding, orig_arr.dtype)
 
     # Boost EMA for revived vectors so they survive ~700 steps (1e-3 / (1-0.99) = 0.1
     # effective selection rate) before next revival check, giving L_reuse time to
@@ -2040,6 +2165,10 @@ def train(run_cfg: RunConfig) -> None:
     rng = jax.random.PRNGKey(tcfg.seed)
     sharded_pool = _make_sharded_pool_vectors(cfg, mesh, rng)  # None if n_model==1
     model = DWAModel(cfg, nnx.Rngs(rng), pool_vectors=sharded_pool)
+    # FSDP: split the large transformer + lm_head params across the model axis
+    # so they (and their Adam moments) aren't replicated on every device.
+    if mesh is not None:
+        _fsdp_shard_params(model, mesh)
     optimizer = _build_optimizer(model, tcfg, scheduler)
     pool_ema = jnp.zeros(cfg.N)
 

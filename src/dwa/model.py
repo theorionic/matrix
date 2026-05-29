@@ -221,10 +221,15 @@ class DWAModel(nnx.Module):
                     cfg.d_B, cfg.r, cfg.d_A,
                 )
         else:
-            pool_vecs = self.pool.vectors[...].astype(jnp.float32)
             if use_dist:
-                # Distributed model-sharded path: full gather required
-                gathered = _distributed_gather(pool_vecs, indices, mesh)
+                # Distributed model-sharded path: full gather required.
+                # Gather in the pool's native (bf16) dtype and cast only the
+                # small [B, k, D] result to float32 — casting the *entire*
+                # sharded pool to float32 first is a multi-GB transient inside
+                # the scan (e.g. ~2 GB/device at N=131072, D=16384, n_model=4).
+                gathered = _distributed_gather(
+                    self.pool.vectors[...], indices, mesh
+                ).astype(jnp.float32)
                 if use_pallas and mesh is not None:
                     h_mid_no_ln, W = shard_pallas_assemble(
                         gathered, alphas, h_A, W_base, b_base, gamma,
@@ -236,6 +241,7 @@ class DWAModel(nnx.Module):
                         cfg.d_B, cfg.r, cfg.d_A,
                     )
             elif use_pallas:
+                pool_vecs = self.pool.vectors[...].astype(jnp.float32)
                 # TPU single-device: split-pool gather + Pallas VMEM assembly.
                 # split_pool_gather reads only s3 = d_B*r + r*d_A + d_B floats/vec
                 # instead of D, reducing HBM bandwidth by D/s3 (1.3–3.6× at configs).
@@ -247,6 +253,7 @@ class DWAModel(nnx.Module):
                 )
             else:
                 # CPU / no-Pallas: fused gather+assembly — split gather avoids [B,k,D]
+                pool_vecs = self.pool.vectors[...].astype(jnp.float32)
                 h_mid_no_ln, W = fused_gather_assemble(
                     pool_vecs, indices, alphas, h_A, W_base, b_base, gamma,
                     cfg.d_B, cfg.r, cfg.d_A,
