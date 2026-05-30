@@ -19,7 +19,7 @@ model:
   n_layers_A: 8
   n_layers_B: 8
   ffn_mult: 4
-  vocab_size: 32000
+  vocab_size: 50257
   seq_len: 1024
   gamma_init: 0.1
   bf16_pool: true
@@ -33,7 +33,7 @@ model:
 train:
   warmup_steps: 500
   gate_on_steps: 5000
-  total_steps: 400
+  total_steps: 40000
   lambda_gate_start: 1.0
   lambda_gate_end: 3.0
   lambda_sharpen_end: 6.0
