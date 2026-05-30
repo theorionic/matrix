@@ -1,0 +1,114 @@
+# DWA 700M + PQ — large pool (512K vectors) with Product Quantization retrieval
+#
+# Parameter breakdown (~1.1B total):
+#   Pool (N×D):       524288 × 8192  = 4.3B params  ← 8× larger than 700m
+#   Parts A+B:        8+8 layers @ d=768  =  97M
+#   Embed + LM head:  32000 × 768 × 2    =  49M
+#   Key proj + other:                    =   3M
+#
+# PQ replaces IVF for retrieval at this pool size:
+#   Exact search: 524K × 64 = 33.6M ops/query
+#   PQ approx:    8×256 + 524K×8 = 4.2M ops/query  → ~8× faster
+#   Then exact on 2048 candidates only
+#
+# Sharding: 4-way model parallel to split the 4.3B pool across devices
+#   Pool per device: 524288 × 8192 / 4 = 1.07B params × 2B (bf16) = ~2.1GB
+#   Pool+Adam/device: ~6.4GB — fits 16GB TPU HBM with room for activations
+#
+# Note: use_pq=true disables IVF (PQ takes priority in retrieval.py).
+#       PQ codebook is fit once at step 0 then every 500 steps via k-means.
+
+name: 700m_pq
+model:
+  D: 8192
+  N: 524288         # 512K vectors — 8× scale-up from 700m (65536)
+  use_ivf: false    # PQ replaces IVF
+  use_pq: true
+  pq_M: 8           # d_k=64 / 8 = 8-dim subspaces
+  pq_K: 256         # max codewords (uint8)
+  pq_refine: 2048   # exact-cosine candidates after PQ filter
+  pq_update_interval: 500
+  d_A: 768
+  d_B: 768
+  r: 4
+  k_max: 16
+  S: 4
+  d_k: 64
+  T: 2.0
+  n_heads: 6
+  n_kv_heads: 1
+  use_rope: true
+  n_layers_A: 8
+  n_layers_B: 8
+  ffn_mult: 4
+  vocab_size: 32000
+  seq_len: 1024
+  gamma_init: 0.1
+  bf16_pool: true
+  compute_dtype: bfloat16
+  remat: true
+  use_flash_attn: false
+  vocab_parallel: true
+  use_hypernetwork: false
+train:
+  warmup_steps: 1000        # longer warmup for larger pool
+  gate_on_steps: 8000
+  total_steps: 250000
+  lambda_gate_start: 1.0
+  lambda_gate_end: 3.0
+  lambda_sharpen_end: 6.0
+  gate_ramp_steps: 500
+  lambda_util: 0.00005      # scaled down for N=512K (l_util range grows with N)
+  lambda_reuse: 0.005
+  lambda_div: 0.01
+  lambda_norm: 0.0001
+  lambda_sparse: 0.0
+  lambda_z: 0.01
+  lr_pool: 5.0e-06          # lower LR for 32× larger pool vs medium
+  lr_parts: 5.0e-05
+  lr_retrieval: 5.0e-05
+  lr_threshold: 5.0e-04
+  lr_min_scale: 0.05
+  batch_size: 32
+  steps_per_window: 64
+  seed: 42
+  lr_warmup_steps: 1500
+  ema_decay: 0.99
+  grad_clip_norm: 1.0
+  nan_emergency_stop: 5
+  loss_spike_sigma: 5.0
+  dead_vector_threshold: 1.0e-06
+  revival_interval_steps: 200
+  max_revival_frac: 0.02
+  revival_noise_factor: 0.1
+sharding:
+  n_model: 4                # 4-way model parallel to shard 4.3B pool
+data:
+  source: hf
+  loader: grain
+  hf_path: openbmb/Ultra-FineWeb
+  hf_subset: ultrafineweb_en
+  hf_text_column: content
+  hf_tokenizer: gpt2
+  val_hf_path: ''
+  val_hf_subset: ''
+  val_hf_text_column: ''
+  gen_every: 2000
+  gen_prompts:
+    - "The history of artificial intelligence"
+    - "In recent years, researchers have discovered"
+    - "The most important thing to understand about"
+  val_every: 500
+  val_batches: 16
+checkpoint:
+  dir: '/kaggle/working/matrix/checkpoints'
+  every: 2000
+  resume: true
+  keep: 3
+gdrive:
+  enabled: true
+  rclone_remote: gdrive
+  remote_path: checkpoints-dwa
+  push_on_save: true
+  pull_on_resume: true
+  rclone_args: "--transfers 4"

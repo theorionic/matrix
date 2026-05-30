@@ -1,11 +1,25 @@
-# DWA 700M with Sharded Pool vectors across the model parallel axis
+# DWA 700M with PQ retrieval — large replicated pool (128K vectors)
+#
+# PQ requires shard_pool=false (pool replicated per device).
+# IVF is disabled; PQ handles retrieval at this pool scale.
+#
+# Memory per device (n_model=2, 16GB TPU):
+#   Pool (N×D bf16):      131072 × 8192 × 2B = 2.0 GB  (replicated)
+#   Pool Adam (m+v):      2 × 2.0 GB          = 4.0 GB
+#   Transformer (sharded):                    = 0.3 GB
+#   Activations budget:   ~9.7 GB             ✓
+#
+# PQ speedup vs exact:  131K × 64 → 8×256 + 131K×8 = ~16× fewer ops
 name: 700m_pool_sharded
 model:
   D: 8192
-  N: 16384
-  use_ivf: true
-  C: 128          # sqrt(16384) = 128
-  m: 8
+  N: 131072         # 128K — 8× scale-up; replicated pool fits HBM with PQ
+  use_ivf: false    # PQ replaces IVF
+  use_pq: true
+  pq_M: 8           # d_k=64 / 8 = 8-dim subspaces
+  pq_K: 256         # max codewords for uint8
+  pq_refine: 1024   # exact-cosine candidates after PQ filter
+  pq_update_interval: 500
   d_A: 768
   d_B: 768
   r: 4
@@ -28,7 +42,7 @@ model:
   use_flash_attn: false
   vocab_parallel: true
   shard_transformer: true
-  shard_pool: true
+  shard_pool: false   # PQ disabled when pool is model-sharded; replicate instead
   use_hypernetwork: false
 train:
   warmup_steps: 5000
