@@ -31,9 +31,9 @@ model:
   shard_pool: true
   use_hypernetwork: false
 train:
-  warmup_steps: 500
-  gate_on_steps: 5000
-  total_steps: 400
+  warmup_steps: 5000
+  gate_on_steps: 20000
+  total_steps: 40000
   lambda_gate_start: 1.0
   lambda_gate_end: 3.0
   lambda_sharpen_end: 6.0
@@ -81,7 +81,7 @@ data:
   val_every: 500
   val_batches: 16
 checkpoint:
-  dir: ''
+  dir: '/kaggle/working/matrix/checkpoints'
   every: 0
   resume: false
   keep: 3
