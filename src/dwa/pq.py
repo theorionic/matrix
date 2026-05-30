@@ -104,26 +104,55 @@ class ProductQuantizer(nnx.Module):
 
 def _kmeans(data: "np.ndarray", K: int, seed: int = 0, n_iter: int = 20):
     """K-means on [N, d] data. Returns (centroids [K, d], assignments [N]).
-    Uses sklearn MiniBatchKMeans when available; falls back to numpy Lloyd's."""
+
+    Uses sklearn MiniBatchKMeans with BLAS thread limit (avoids OpenBLAS crash
+    on TPU machines with >128 CPU cores). Falls back to pure-numpy Lloyd's if
+    sklearn or threadpoolctl unavailable.
+    """
     import numpy as np
 
     try:
         from sklearn.cluster import MiniBatchKMeans
-        km = MiniBatchKMeans(n_clusters=K, n_init=3, max_iter=n_iter, random_state=seed)
-        km.fit(data)
+
+        # Limit BLAS threads at runtime — OpenBLAS crashes when thread count
+        # exceeds its compile-time MAX_THREADS (128) on large TPU host machines.
+        # threadpoolctl works after numpy is already loaded; env vars do not.
+        try:
+            from threadpoolctl import threadpool_limits
+            blas_ctx = threadpool_limits(limits=32, user_api="blas")
+        except ImportError:
+            import contextlib
+            blas_ctx = contextlib.nullcontext()
+
+        with blas_ctx:
+            km = MiniBatchKMeans(n_clusters=K, n_init=3, max_iter=n_iter, random_state=seed)
+            km.fit(data)
         centroids = km.cluster_centers_.astype(np.float32)
-    except ImportError:
+
+    except Exception:
+        # Pure-numpy fallback: no BLAS calls, safe on any machine.
+        # Uses ||a-b||² = ||a||² + ||b||² - 2·a·b to avoid [N,K,d] broadcast.
         rng = np.random.default_rng(seed)
         idx = rng.choice(len(data), K, replace=False)
         centroids = data[idx].copy().astype(np.float32)
         for _ in range(n_iter):
-            dists  = np.sum((data[:, None] - centroids[None]) ** 2, axis=-1)  # [N, K]
+            dists  = _sq_dists(data, centroids)
             assign = np.argmin(dists, axis=-1)
             for k in range(K):
                 mask = assign == k
                 if mask.any():
                     centroids[k] = data[mask].mean(0)
 
-    dists  = np.sum((data[:, None] - centroids[None]) ** 2, axis=-1)
-    assign = np.argmin(dists, axis=-1)
+    assign = np.argmin(_sq_dists(data, centroids), axis=-1)
     return centroids, assign
+
+
+def _sq_dists(a: "np.ndarray", b: "np.ndarray") -> "np.ndarray":
+    """Squared L2 distances [N, K] between rows of a [N,d] and b [K,d].
+    Uses a²+b²-2ab form to avoid materialising [N,K,d] intermediate."""
+    import numpy as np
+    return (
+        (a ** 2).sum(-1, keepdims=True)   # [N, 1]
+        + (b ** 2).sum(-1)                # [K]
+        - 2.0 * (a @ b.T)                 # [N, K]  — small d, safe BLAS call
+    ).clip(0)
