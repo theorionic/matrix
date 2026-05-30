@@ -6,6 +6,7 @@ from .losses import aux_losses, task_loss
 from .model import DWAModel, forward_and_loss
 from .parts import PartA, PartB
 from .pool import VectorPool
+from .pq import ProductQuantizer
 from .retrieval import MultiAspectRetrieval
 from .schedule import PhaseScheduler
 
@@ -18,6 +19,7 @@ __all__ = [
     "WeightAssembler",
     "PartA",
     "PartB",
+    "ProductQuantizer",
     "PhaseScheduler",
     "aux_losses",
     "task_loss",

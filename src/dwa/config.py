@@ -15,6 +15,14 @@ class DWAConfig:
     C: int = 128       # number of centroids
     m: int = 8         # number of clusters to search
 
+    # Product Quantization (PQ) — fast approximate retrieval for large N
+    # Replaces IVF when enabled. Scales to N=10M+ with O(M·K + N·M) cost.
+    use_pq: bool = False
+    pq_M: int = 8            # subspaces; d_k must be divisible by pq_M
+    pq_K: int = 256          # codewords per subspace (≤256 for uint8 codes)
+    pq_refine: int = 1024    # candidates for exact-cosine refinement after PQ filter
+    pq_update_interval: int = 500  # steps between PQ refit (k-means + re-encode)
+
     # Transformer hidden dims
     d_A: int = 256     # Part A hidden dim
     d_B: int = 256     # Part B hidden dim (must equal d_A for residual)
@@ -87,6 +95,14 @@ class DWAConfig:
             )
             assert self.m <= self.C, (
                 f"m={self.m} (clusters searched) must be ≤ C={self.C} (total clusters)"
+            )
+        if self.use_pq:
+            assert self.d_k % self.pq_M == 0, (
+                f"d_k={self.d_k} must be divisible by pq_M={self.pq_M}"
+            )
+            assert self.pq_K <= 256, f"pq_K={self.pq_K} exceeds uint8 max (256)"
+            assert self.pq_refine >= self.k_max, (
+                f"pq_refine={self.pq_refine} must be >= k_max={self.k_max}"
             )
 
     @classmethod

@@ -2446,6 +2446,27 @@ def train(run_cfg: RunConfig) -> None:
         jax.block_until_ready(
             (info["losses"], info["last_indices"], info["grad_norms"], info["nan_flags"])
         )
+
+        # ── PQ refit (host-side k-means + re-encode) ──────────────────────────
+        if cfg.use_pq:
+            _pq_sharded = (
+                mesh is not None
+                and "model" in mesh.axis_names
+                and mesh.shape["model"] > 1
+                and cfg.shard_pool
+            )
+            if not _pq_sharded:
+                pq_every = max(1, cfg.pq_update_interval // tcfg.steps_per_window)
+                if window_idx % pq_every == 0:
+                    pq_keys = model.pool.compute_keys()   # [S, N, d_k] float32
+                    pq_keys_norm = pq_keys / (
+                        jnp.linalg.norm(pq_keys, axis=-1, keepdims=True) + 1e-8
+                    )
+                    model.retrieval.pq.update(pq_keys_norm)
+                    if not model.retrieval.pq_ready:
+                        model.retrieval.pq_ready = True
+                        _log("[PQ] Codebook fitted — PQ retrieval now active.")
+
         win_secs = time.time() - t_win
 
         steps_done += tcfg.steps_per_window

@@ -5,6 +5,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from .config import DWAConfig
+from .pq import ProductQuantizer
 from .utils import cosine_sim_batched
 
 
@@ -48,6 +49,12 @@ class MultiAspectRetrieval(nnx.Module):
             jax.random.normal(rngs.params(), (cfg.S, cfg.C, cfg.d_k)) * (cfg.d_k ** -0.5)
         )
 
+        if cfg.use_pq:
+            self.pq = ProductQuantizer(cfg, rngs)
+        # Python bool — not JAX state. Set True after first pq.update() call.
+        # Causes one JIT retrace when PQ becomes ready; acceptable.
+        self.pq_ready = False
+
     def __call__(
         self,
         z: jnp.ndarray,           # [B, d_A]
@@ -84,7 +91,72 @@ class MultiAspectRetrieval(nnx.Module):
             and mesh.shape["model"] > 1
             and cfg.shard_pool
         )
-        use_ivf_now = cfg.use_ivf and not model_sharded
+        # PQ takes priority over IVF; disable IVF when PQ is active.
+        use_ivf_now = cfg.use_ivf and not model_sharded and not (cfg.use_pq and self.pq_ready)
+
+        # ── Exploration noise (shared across all retrieval paths) ─────────────
+        # Gumbel noise anneals via (1 - gate_mix); floor at min_explore_noise.
+        # Computed with JAX ops so gate_mix can be a traced scalar.
+        explore_sigma = jnp.maximum(
+            jnp.float32(cfg.min_explore_noise),
+            cfg.warmup_explore_noise * (1.0 - gate_mix),
+        )
+
+        def _explore_scores(scores):
+            # Deterministic per-batch seed derived from z; stop-grad so noise
+            # scale is not tied to the query gradient path.
+            seed_f = jax.lax.stop_gradient(jnp.sum(z.astype(jnp.float32)))
+            seed_u = jax.lax.bitcast_convert_type(seed_f.astype(jnp.float32), jnp.uint32)
+            key    = jax.random.PRNGKey(seed_u)
+            gumbel = jax.random.gumbel(key, scores.shape).astype(scores.dtype)
+            return scores + explore_sigma * gumbel
+
+        # ── PQ path ──────────────────────────────────────────────────────────
+        # Two-stage: PQ approx scores (O(M·K + N·M)) → top-pq_refine candidates
+        # → exact cosine refinement → top-k_max selection.
+        # Early return; skips IVF/full-search block entirely.
+        if cfg.use_pq and self.pq_ready and not model_sharded:
+            approx    = self.pq.approx_scores(q_norm, w)                      # [B, N]
+            soft_full = jax.nn.softmax(approx / cfg.T, axis=-1)               # [B, N]
+            l_z       = (jax.nn.logsumexp(approx / cfg.T, axis=-1) ** 2).mean()
+
+            _, cand_idx = jax.lax.top_k(approx, cfg.pq_refine)               # [B, pq_refine]
+            cand_keys   = jax.vmap(lambda idx: pool_keys[:, idx, :])(cand_idx)  # [B,S,R,d_k]
+            ck_norm     = cand_keys / (jnp.linalg.norm(cand_keys, axis=-1, keepdims=True) + 1e-8)
+            s_cand      = jnp.einsum("s,bsn->bn", w,
+                              jnp.einsum("bsk,bsnk->bsn", q_norm, ck_norm))   # [B, pq_refine]
+
+            def pq_warmup_select(_):
+                noisy      = _explore_scores(s_cand)
+                _, lidx    = jax.lax.top_k(noisy, cfg.k_max)
+                global_idx = jnp.take_along_axis(cand_idx, lidx, axis=1)
+                alpha      = jax.nn.softmax(
+                    jnp.take_along_axis(s_cand, lidx, axis=1) / cfg.T, axis=-1)
+                return alpha, global_idx, soft_full
+
+            def pq_gate_select(_):
+                g          = jax.nn.sigmoid(lambda_val * (s_cand - self.tau[...]))
+                noisy      = _explore_scores(g * s_cand)
+                _, lidx    = jax.lax.top_k(noisy, cfg.k_max)
+                global_idx = jnp.take_along_axis(cand_idx, lidx, axis=1)
+                alpha      = jax.nn.softmax(
+                    jnp.take_along_axis(s_cand, lidx, axis=1) / cfg.T, axis=-1)
+                return alpha, global_idx, soft_full
+
+            def pq_blended_select(_):
+                wu_alpha, wu_idx, _ = pq_warmup_select(None)
+                g_alpha,  g_idx,  _ = pq_gate_select(None)
+                return (1.0 - gate_mix) * wu_alpha + gate_mix * g_alpha, g_idx, soft_full
+
+            if is_warmup:
+                alphas, indices, soft_full_out = pq_warmup_select(None)
+            else:
+                branch = jnp.where(gate_mix <= 0.0, 0,
+                                   jnp.where(gate_mix >= 1.0, 2, 1)).astype(jnp.int32)
+                alphas, indices, soft_full_out = jax.lax.switch(
+                    branch, [pq_warmup_select, pq_blended_select, pq_gate_select], None
+                )
+            return alphas, indices, soft_full_out, l_z
 
         if use_ivf_now:
             # ── Stage 1: centroid search (tiny; fits in L1 cache) ────────────
@@ -151,7 +223,7 @@ class MultiAspectRetrieval(nnx.Module):
         s_for_z = s_i_full if use_ivf_now else s_i
         l_z = (jax.nn.logsumexp(s_for_z / cfg.T, axis=-1) ** 2).mean()
 
-        # ── Selection ────────────────────────────────────────────────────────
+        # ── Selection (IVF / full-search paths) ──────────────────────────────
         # Three modes controlled by is_warmup and gate_mix:
         #   is_warmup=True  → pure warmup (top-k + softmax)
         #   gate_mix=0      → pure warmup (top-k + softmax)
@@ -160,31 +232,6 @@ class MultiAspectRetrieval(nnx.Module):
         #
         # soft_full [B, N] covers ALL pool vectors regardless of IVF path,
         # so l_util entropy gradient reaches every vector every step.
-        #
-        # Warmup exploration: hard top-k is deterministic, which creates a
-        # positive-feedback loop (selected vectors get strong assembly gradient,
-        # gain advantage, get re-selected) → pool collapse before aux losses
-        # can counter-balance.  We add Gumbel noise to scores before top-k so
-        # every vector has non-zero selection probability during warmup.  Noise
-        # scale anneals via (1 - gate_mix) → vanishes once the gate is fully on.
-        # Seed is derived from z (varies per-batch) to avoid threading RNGs.
-        # explore_sigma anneals with gate_mix; computed with JAX ops so gate_mix
-        # can be a traced scalar (no Python float() needed).
-        explore_sigma = jnp.maximum(
-            jnp.float32(cfg.min_explore_noise),
-            cfg.warmup_explore_noise * (1.0 - gate_mix),
-        )
-
-        def _explore_scores(scores):
-            # Deterministic per-batch seed: hash z into a uint32 via bit-cast.
-            # Stop-grad: we do not want the noise scale tied to the query
-            # gradient path.  bitcast_convert_type avoids int-cast saturation
-            # for arbitrary z magnitudes.
-            seed_f = jax.lax.stop_gradient(jnp.sum(z.astype(jnp.float32)))
-            seed_u = jax.lax.bitcast_convert_type(seed_f.astype(jnp.float32), jnp.uint32)
-            key    = jax.random.PRNGKey(seed_u)
-            gumbel = jax.random.gumbel(key, scores.shape).astype(scores.dtype)
-            return scores + explore_sigma * gumbel
 
         def warmup_select(_):
             noisy = _explore_scores(s_i)
