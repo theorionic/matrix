@@ -158,9 +158,19 @@ def _build_tx(model: DWAModel, tcfg: TrainConfig,
     def _sched(base_lr: float):
         return scheduler.make_optax_schedule(base_lr * lr_scale)
 
+    # Pool optimizer: Adafactor saves ~2× memory vs Adam (no per-param m/v).
+    # multiply_by_parameter_scale=False so explicit LR schedule is used as-is.
+    if tcfg.use_adafactor_pool:
+        pool_opt = optax.adafactor(
+            learning_rate=_sched(tcfg.lr_pool),
+            multiply_by_parameter_scale=False,
+        )
+    else:
+        pool_opt = optax.adam(_sched(tcfg.lr_pool))
+
     return optax.chain(
         optax.clip_by_global_norm(tcfg.grad_clip_norm),
-        optax.masked(optax.adam(_sched(tcfg.lr_pool)),       _make_mask("pool")),
+        optax.masked(pool_opt,                                _make_mask("pool")),
         optax.masked(optax.adam(_sched(tcfg.lr_threshold)),  _make_mask("threshold")),
         optax.masked(optax.adam(_sched(tcfg.lr_retrieval)),  _make_mask("retrieval")),
         optax.masked(optax.adam(_sched(tcfg.lr_parts)),      _make_mask("parts")),
@@ -185,7 +195,7 @@ def _build_optimizer(model: DWAModel, tcfg: TrainConfig,
 # Multi-device mesh helpers
 # ---------------------------------------------------------------------------
 
-def _select_n_model(cfg: DWAConfig, n_devices: int, override: int | str = "auto") -> int:
+def _select_n_model(cfg: DWAConfig, tcfg: TrainConfig, n_devices: int, override: int | str = "auto") -> int:
     """
     Choose model-parallel sharding degree so pool+Adam fits in ~4 GB/device.
 
@@ -195,7 +205,10 @@ def _select_n_model(cfg: DWAConfig, n_devices: int, override: int | str = "auto"
         n = int(override)
         assert n_devices % n == 0, f"n_model={n} must divide n_devices={n_devices}"
         return n
-    pool_and_adam_bytes = cfg.N * cfg.D * 4 * 3  # float32 params + m + v
+    # Adafactor stores factored second moment (~N+D) instead of full N×D m+v.
+    # Memory multiplier: 3× (Adam) → ~1.05× (Adafactor) for large N.
+    mem_multiplier = 1.05 if tcfg.use_adafactor_pool else 3
+    pool_and_adam_bytes = cfg.N * cfg.D * 4 * mem_multiplier  # float32
     target_bytes = 4 * 1024 ** 3  # 4 GB threshold
     for n_model in [1, 2, 4, 8]:
         if n_model > n_devices:
@@ -2138,7 +2151,7 @@ def train(run_cfg: RunConfig) -> None:
     device_kind = devices[0].device_kind
 
     # --- Mesh: 2D (data × model) ---
-    n_model = _select_n_model(cfg, n_devices, run_cfg.sharding.n_model)
+    n_model = _select_n_model(cfg, tcfg, n_devices, run_cfg.sharding.n_model)
     n_data = n_devices // n_model
     mesh = _build_mesh(devices, n_model)
 

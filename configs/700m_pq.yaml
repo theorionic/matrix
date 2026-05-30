@@ -64,6 +64,7 @@ train:
   lambda_norm: 0.0001
   lambda_sparse: 0.0
   lambda_z: 0.01
+  use_adafactor_pool: true  # saves ~2× pool memory; no per-param m/v states
   lr_pool: 5.0e-06          # lower LR for 32× larger pool vs medium
   lr_parts: 5.0e-05
   lr_retrieval: 5.0e-05

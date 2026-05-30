@@ -265,6 +265,12 @@ class TrainConfig:
 
     lr_min_scale: float = 0.05
 
+    # Use Adafactor instead of Adam for pool parameters.
+    # Saves ~2× pool memory (no per-param m/v states; factored second moment).
+    # Pool memory: 3× params (Adam) → ~1× params (Adafactor).
+    # Recommended when N > 64K or pool dominates HBM budget.
+    use_adafactor_pool: bool = False
+
     @property
     def lr_warmup(self) -> int:
         return self.lr_warmup_steps
