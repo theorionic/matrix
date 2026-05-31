@@ -114,16 +114,26 @@ class MultiAspectRetrieval(nnx.Module):
             candidate_indices = cand_idx                              # [B, K_refine]
 
             # ── Full-pool soft scores for l_util ─────────────────────────────
-            # Computing soft_full only over IVF candidates means l_util gradient
-            # never reaches the 93%+ of pool vectors not searched this step —
-            # the root cause of pool collapse.  We pay one extra full-pool matmul
-            # here (cheap vs. TPU headroom) so every vector gets gradient.
-            p_norm_full = pool_keys / (
-                jnp.linalg.norm(pool_keys, axis=-1, keepdims=True) + 1e-8
-            )
-            sim_all  = jnp.einsum("bsk,snk->bsn", q_norm, p_norm_full)  # [B, S, N]
-            s_i_full = jnp.einsum("s,bsn->bn", w, sim_all)               # [B, N]
-            soft_full = jax.nn.softmax(s_i_full / cfg.T, axis=-1)        # [B, N]
+            if cfg.approx_soft_full:
+                # Centroid approximation: ~0.5 MB instead of 34 MB per step.
+                # Each pool vector inherits its cluster's softmax score uniformly.
+                # c_score [B, C] already computed in Stage 1 — zero extra bandwidth.
+                # Tradeoff: l_util/l_reuse gradient operates at cluster granularity
+                # instead of per-vector.  Revival mechanism handles dead vectors.
+                N_per_C  = cfg.N // cfg.C
+                c_soft   = jax.nn.softmax(c_score / cfg.T, axis=-1)     # [B, C]
+                soft_full = jnp.repeat(c_soft, N_per_C, axis=-1) / N_per_C  # [B, N]
+                # s_i_full for z-loss: expand cluster scores to [B, N]
+                s_i_full = jnp.repeat(c_score, N_per_C, axis=-1)        # [B, N]
+            else:
+                # Exact full-pool pass: reads [S,N,d_k]=32 MB per step.
+                # Every vector gets precise per-vector gradient for l_util/l_reuse.
+                p_norm_full = pool_keys / (
+                    jnp.linalg.norm(pool_keys, axis=-1, keepdims=True) + 1e-8
+                )
+                sim_all  = jnp.einsum("bsk,snk->bsn", q_norm, p_norm_full)  # [B, S, N]
+                s_i_full = jnp.einsum("s,bsn->bn", w, sim_all)               # [B, N]
+                soft_full = jax.nn.softmax(s_i_full / cfg.T, axis=-1)        # [B, N]
 
         else:
             # ── Full search (used when model-sharded or IVF disabled) ────────

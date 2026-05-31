@@ -49,12 +49,13 @@ def apply_rope(x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray):
 
 class CausalSelfAttention(nnx.Module):
     def __init__(self, cfg: DWAConfig, d_model: int, n_heads: int, n_kv_heads: int,
-                 rngs: nnx.Rngs, compute_dtype=None) -> None:
+                 rngs: nnx.Rngs, compute_dtype=None, flash_part: bool = False) -> None:
         self.cfg = cfg
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = d_model // n_heads
         self._cdtype = compute_dtype
+        self._flash_part = flash_part  # per-part flash attn override
         
         self.Wq = nnx.Linear(d_model, d_model, use_bias=False,
                              dtype=compute_dtype, rngs=rngs)
@@ -91,7 +92,11 @@ class CausalSelfAttention(nnx.Module):
             v = jnp.repeat(v, H // Hk, axis=2)
 
         is_tpu = any(d.platform == "tpu" for d in jax.devices())
-        if self.cfg.use_flash_attn and HAS_PALLAS_ATTN and is_tpu and mesh is not None:
+        _want_flash = (
+            self.cfg.use_flash_attn
+            or (self._flash_part and HAS_PALLAS_ATTN and is_tpu)
+        )
+        if _want_flash and HAS_PALLAS_ATTN and is_tpu and mesh is not None:
             # Pallas FlashAttention expects [Batch, Heads, Time, HeadDim]
             q, k, v = q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)
             out = shard_flash_attention(q, k, v, True, self.scale, mesh)
@@ -125,9 +130,10 @@ class FFN(nnx.Module):
 class TransformerBlock(nnx.Module):
     def __init__(self, cfg: DWAConfig, d_model: int, n_heads: int, n_kv_heads: int,
                  ffn_mult: int, rngs: nnx.Rngs,
-                 compute_dtype=None, remat: bool = False) -> None:
+                 compute_dtype=None, remat: bool = False, flash_part: bool = False) -> None:
         self.norm1 = nnx.RMSNorm(d_model, rngs=rngs)
-        self.attn = CausalSelfAttention(cfg, d_model, n_heads, n_kv_heads, rngs, compute_dtype)
+        self.attn = CausalSelfAttention(cfg, d_model, n_heads, n_kv_heads, rngs, compute_dtype,
+                                        flash_part=flash_part)
         self.norm2 = nnx.RMSNorm(d_model, rngs=rngs)
         self.ffn = FFN(d_model, ffn_mult, rngs, compute_dtype)
         self._remat = remat
@@ -152,9 +158,11 @@ class PartA(nnx.Module):
     """
 
     def __init__(self, cfg: DWAConfig, rngs: nnx.Rngs) -> None:
+        flash_a = cfg.flash_attn_parts in ("both", "part_a")
         self.blocks = nnx.List([
             TransformerBlock(cfg, cfg.d_A, cfg.n_heads, cfg.n_kv_heads,
-                             cfg.ffn_mult, rngs, cfg.compute_dtype, cfg.remat)
+                             cfg.ffn_mult, rngs, cfg.compute_dtype, cfg.remat,
+                             flash_part=flash_a)
             for _ in range(cfg.n_layers_A)
         ])
         self.norm = nnx.RMSNorm(cfg.d_A, rngs=rngs)
@@ -173,9 +181,11 @@ class PartB(nnx.Module):
     """
 
     def __init__(self, cfg: DWAConfig, rngs: nnx.Rngs) -> None:
+        flash_b = cfg.flash_attn_parts in ("both", "part_b")
         self.blocks = nnx.List([
             TransformerBlock(cfg, cfg.d_B, cfg.n_heads, cfg.n_kv_heads,
-                             cfg.ffn_mult, rngs, cfg.compute_dtype, cfg.remat)
+                             cfg.ffn_mult, rngs, cfg.compute_dtype, cfg.remat,
+                             flash_part=flash_b)
             for _ in range(cfg.n_layers_B)
         ])
         self.norm = nnx.RMSNorm(cfg.d_B, rngs=rngs)

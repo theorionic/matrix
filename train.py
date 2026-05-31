@@ -1393,10 +1393,13 @@ def _revive_dead_vectors(
         emb_np[dead_idx] = emb_np[chosen_donors] + noise
 
         orig_arr = model.pool.embeddings[...]
-        new_jax  = jnp.array(emb_np, dtype=orig_arr.dtype)
         orig_sharding = getattr(orig_arr, "sharding", None)
         if orig_sharding is not None:
-            new_jax = jax.device_put(new_jax, orig_sharding)
+            new_jax = jax.device_put(emb_np, orig_sharding)
+            if new_jax.dtype != orig_arr.dtype:
+                new_jax = new_jax.astype(orig_arr.dtype)
+        else:
+            new_jax = jnp.array(emb_np, dtype=orig_arr.dtype)
         model.pool.embeddings[...] = new_jax
     else:
         # Standard pool revival
@@ -1407,10 +1410,15 @@ def _revive_dead_vectors(
         pool_np[dead_idx] = pool_np[chosen_donors] + noise
 
         orig_arr = model.pool.vectors[...]
-        new_jax  = jnp.array(pool_np, dtype=orig_arr.dtype)
         orig_sharding = getattr(orig_arr, "sharding", None)
         if orig_sharding is not None:
-            new_jax = jax.device_put(new_jax, orig_sharding)
+            # Direct device_put from numpy → sharding avoids materialising the full 1.07GB
+            # pool on device 0 first (jnp.array() would, fragmenting the bottom of HBM).
+            new_jax = jax.device_put(pool_np, orig_sharding)
+            if new_jax.dtype != orig_arr.dtype:
+                new_jax = new_jax.astype(orig_arr.dtype)
+        else:
+            new_jax = jnp.array(pool_np, dtype=orig_arr.dtype)
         model.pool.vectors[...] = new_jax
 
     # Boost EMA for revived vectors so they survive ~700 steps (1e-3 / (1-0.99) = 0.1
@@ -2427,6 +2435,10 @@ def train(run_cfg: RunConfig) -> None:
             _n_revived_this_win, pool_ema = _revive_dead_vectors(model, pool_ema, cfg, tcfg, steps_done)
             if _n_revived_this_win > 0:
                 _log(f"[Safety] Revived {_n_revived_this_win}/{cfg.N} dead pool vectors.")
+            # Force Python GC and JAX to release any temporary HBM allocations
+            # made during revival before the next train_window loads its program binary.
+            import gc as _gc; _gc.collect()
+            jax.effects_barrier()
 
         # Validation loss (boundary crossing — fires every val_every steps)
         if val_cache is not None and val_every > 0 and \

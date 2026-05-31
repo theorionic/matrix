@@ -47,13 +47,24 @@ class DWAConfig:
     bf16_pool: bool = True   # store pool vectors in bfloat16 (halves gather bandwidth)
     compute_dtype: Any = None  # None=float32; set to jnp.bfloat16 for ~4× MXU throughput
     remat: bool = False        # gradient checkpointing: recompute activations, cut ~4× activation memory
-    use_flash_attn: bool = False  # Pallas flash attention (hits VMEM limit inside scan+vjp; inference-only)
+    use_flash_attn: bool = False  # Pallas flash attention for BOTH parts (VMEM contention with assembly)
+    # Fine-grained flash attention: enable only for PartB (runs after assembly, no VMEM overlap).
+    # PartA standard + Pallas assembly + PartB flash → only one Pallas kernel in VMEM per step.
+    # Values: "none", "part_b", "both"  (overrides use_flash_attn when set)
+    flash_attn_parts: str = "none"
     vocab_parallel: bool = True   # shard lm_head across model axis — avoids materialising full [B,T,V] logits
 
     # Hypernetwork pool generator (swapping memory bandwidth for compute)
     use_hypernetwork: bool = False
     d_emb: int = 128
     mlp_hidden_dims: tuple[int, ...] = (512, 1024)
+
+    # Approximate soft_full with centroid scores instead of full-pool cosine pass.
+    # Saves reading [S,N,d_k]=32MB every step; uses centroid scores (already computed
+    # in Stage 1 IVF) to assign uniform scores within each cluster.
+    # Tradeoff: l_util/l_reuse operate at cluster granularity — rely more on revival.
+    # Only active when use_ivf=True.
+    approx_soft_full: bool = False
 
     # Exploration noise (Gumbel) added to retrieval scores during warmup top-k.
     # Annealed via (1 - gate_mix) so noise fades as the gate ramps in.
